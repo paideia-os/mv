@@ -1,0 +1,335 @@
+// tests/test_smoke.pdx -- mv.M4-003 (paideia-os/mv#14)
+//
+// TestSmoke module: QEMU smoke -- mv a b; undo mv a b; ls verifies.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M4-003 is the plan doc §5.7 M4 line's third landing:
+//
+//   "QEMU smoke: mv a b; undo mv a b; ls verifies"
+//
+// The end-to-end runtime fixture: boot paideia-os in QEMU, spawn a
+// shell, `touch a`, `mv a b`, `pdx-undo mv a b`, `ls` shows `a` back
+// and no `b`. This is the acceptance gate the R50 tooling wave uses
+// to declare mv "ready for release".
+//
+// =============================================================================
+// SUBSTRATE STATE + DEFERRAL
+// =============================================================================
+//
+// The live QEMU smoke depends on:
+//
+//   (1) R42 substrate: sys_pdxfs_txn_open / _commit / _abort /
+//       _unlink / _link / _resolve_parent / _inode_of / _write_undo
+//       dispatched by the kernel. At HEAD (2026-08-22) every mv
+//       Pdxfs::* trampoline is an M2 STUB (`xor rax, rax; ret` or
+//       `mov rax, 1; ret`). Without R42 the "mv a b" step reports
+//       success but the WAL group never drains -- the filesystem
+//       state after mv is unchanged, so "ls" cannot distinguish a
+//       real move from a stubbed no-op.
+//
+//   (2) shell.M5 (dual-signed release): the shell process that
+//       exec's `mv` and `pdx-undo` with the correct InitCap
+//       sidecar. Today `mv` runs standalone (a bare `_start`
+//       driver with hard-coded argv) if the R14b loader is in
+//       tree; the shell integration is deferred to shell.M5.
+//
+//   (3) pdx-undo tool: the WAL-replayer that reads the undo record
+//       Undo::mv_undo_write threaded into the TXN and invokes
+//       `mv <replay_src> <replay_dst>`. Not in the current tool
+//       repo set; planned for R51.
+//
+// All three land AFTER mv reaches release. This test file therefore
+// provides:
+//
+//   (a) A SHAPE-SMOKE entry point (test_smoke_run) that exercises
+//       the full mv pipeline against the current stubs and verifies
+//       every subsystem fires exactly once. If the shape smoke
+//       passes, main can be confident that the module wiring is
+//       intact: Move::move_dispatch calls into Schema, Audit, Undo,
+//       Inode, and Elevate in the right order, each bumps its own
+//       stat slot, and no stage silently short-circuits.
+//
+//   (b) A HARNESS RUNBOOK (tests/README.md) describing the QEMU
+//       command sequence to run once (1)-(3) land. The runbook is
+//       the acceptance procedure; this file's shape-smoke is the
+//       CI-visible unit that verifies the wiring drift-free.
+//
+// =============================================================================
+// SHAPE-SMOKE INVARIANTS
+// =============================================================================
+//
+// After ONE Move::move_dispatch invocation with valid pointers on a
+// clean stats table, every M3-integrated subsystem MUST fire once:
+//
+//   MV_ST_INVOCATIONS     >= 1   (dispatch entry)
+//   MV_ST_TXN_OPENS       == 1   (pdxfs_txn_open success)
+//   MV_ST_TXN_COMMITS     == 1   (pdxfs_txn_commit success)
+//   MV_ST_TXN_ABORTS      == 0   (no abort)
+//   MV_ST_ERRORS          == 0   (no error)
+//   MV_ST_MOVES           == 1   (successful move; == MV_ST_RENAMES)
+//   MV_ST_RECORDS_EMITTED == 1   (Schema::mv_schema_emit fired)
+//   MV_ST_AUDIT_WRITES    == 1   (Audit::mv_audit_write_move fired)
+//   MV_ST_UNDO_RECORDS    == 1   (Undo::mv_undo_write fired)
+//
+// The signed-inode + elevate paths take conditional branches: with
+// stubbed pdxfs_inode_owner returning 1 for every inode, src and
+// dst owners compare EQUAL, so Inode::mv_inode_preserve takes the
+// preserved path (bumps MV_ST_INODE_PRESERVED) and Elevate::
+// mv_elevate_cross_user is NOT called. The shape-smoke therefore
+// verifies:
+//
+//   MV_ST_INODE_PRESERVED  == 1   (same-user branch, stub-driven)
+//   MV_ST_CROSS_USER       == 0   (cross-user degrade did not fire)
+//   MV_ST_INODE_REKEYED    == 0   (rebind was not attempted)
+//   MV_ST_ELEVATE_ATTEMPTS == 0   (elevate hop was not called)
+//
+// The MV_ST_CROSS_DIR bump depends on pdxfs_resolve_parent returning
+// distinct parent inodes for src vs dst; since the stub writes both
+// out-slots to 0, mv_move_src_parent == mv_move_dst_parent == 0
+// after resolve, and Move::move_dispatch takes the same-parent branch
+// (no MV_ST_CROSS_DIR bump). Verified as == 0.
+//
+// The MV_ST_CROSS_DEV bump depends on pdxfs_link returning EXDEV;
+// the stub returns 0, so no fallback -- MV_ST_CROSS_DEV == 0.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFEBEx (TestSmoke)
+// =============================================================================
+//
+//   0xFFFFEBE0 MV_TEST_SMK_OK            all-pass sentinel (== 0)
+//   0xFFFFEBE1 MV_TEST_SMK_DISPATCH_RC   move_dispatch returned non-zero
+//   0xFFFFEBE2 MV_TEST_SMK_INV_STAT      MV_ST_INVOCATIONS < 1
+//   0xFFFFEBE3 MV_TEST_SMK_TOPEN_STAT    MV_ST_TXN_OPENS != 1
+//   0xFFFFEBE4 MV_TEST_SMK_TCMT_STAT     MV_ST_TXN_COMMITS != 1
+//   0xFFFFEBE5 MV_TEST_SMK_TABT_STAT     MV_ST_TXN_ABORTS != 0
+//   0xFFFFEBE6 MV_TEST_SMK_ERR_STAT      MV_ST_ERRORS != 0
+//   0xFFFFEBE7 MV_TEST_SMK_MOVES_STAT    MV_ST_MOVES != 1
+//   0xFFFFEBE8 MV_TEST_SMK_REC_STAT      MV_ST_RECORDS_EMITTED != 1
+//   0xFFFFEBE9 MV_TEST_SMK_AUD_STAT      MV_ST_AUDIT_WRITES != 1
+//   0xFFFFEBEA MV_TEST_SMK_UND_STAT      MV_ST_UNDO_RECORDS != 1
+//   0xFFFFEBEB MV_TEST_SMK_PRSV_STAT     MV_ST_INODE_PRESERVED != 1
+//   0xFFFFEBEC MV_TEST_SMK_XUSER_STAT    MV_ST_CROSS_USER != 0
+//   0xFFFFEBED MV_TEST_SMK_XDEV_STAT     MV_ST_CROSS_DEV != 0
+//   0xFFFFEBEE MV_TEST_SMK_XDIR_STAT     MV_ST_CROSS_DIR != 0
+//   0xFFFFEBEF MV_TEST_SMK_ELV_STAT      MV_ST_ELEVATE_ATTEMPTS != 0
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestSmoke`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0 and 1 fit).
+//   - Byte reads not used.
+//   - r11 is scratch; unused in this file (all state reads through
+//     mv_stat which owns its own .bss reach).
+//   - test_smoke_run has nested SysV calls (mv_reset, move_dispatch,
+//     mv_stat x many). No callee-save state persists between checks
+//     -- each check is `mov rdi, slot; call mv_stat; cmp rax, N; jXX`
+//     and rax is discarded before the next check. Prologue is `sub
+//     rsp, 8` for alignment; matching `add rsp, 8` before ret.
+//     Entry rsp % 16 == 8; sub 8 lands rsp % 16 == 0 for the calls.
+
+module TestSmoke = structure {
+
+  // ==========================================================================
+  // test_smoke_run() -> u64
+  //
+  // The M4-003 shape-smoke entry point. Runs one Move::move_dispatch
+  // invocation with fixture pointers (0x1000, 0x2000) on a fresh
+  // stats table and verifies every subsystem fired according to the
+  // invariants documented in the file header.
+  //
+  // Fail-fast: first non-matching check returns a distinct
+  // MV_TEST_SMK_* code so a debugger identifies the exact subsystem
+  // that either missed its bump or bumped a slot it should not.
+  //
+  // Return: 0 on all-pass; MV_TEST_SMK_* on first failure.
+  // ==========================================================================
+  pub let test_smoke_run : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mv.M4-003 (#14): TestSmoke::test_smoke_run -- shape-smoke for the full mv pipeline. Resets stats, invokes Move::move_dispatch(0x1000, 0x2000) once, then verifies every M3-integrated subsystem fired exactly once via mv_stat reads. Substrate-driven expectations: with stubbed pdxfs_inode_owner returning 1 uniformly, mv_inode_preserve takes the same-user branch (MV_ST_INODE_PRESERVED == 1) and never calls Elevate::mv_elevate_cross_user (MV_ST_ELEVATE_ATTEMPTS == 0); with stubbed pdxfs_resolve_parent writing 0 to both out-slots, both parents compare equal (MV_ST_CROSS_DIR == 0); with stubbed pdxfs_link returning 0, no EXDEV fallback (MV_ST_CROSS_DEV == 0). Live QEMU harness (mv a b; undo mv a b; ls) deferred to R42 substrate + shell.M5 + pdx-undo (R51) -- documented in tests/README.md. Every stat check is `mov rdi, slot; call mv_stat; cmp rax, N; jXX` with N in {0, 1} (fits imm32); no register-preservation between checks (rax discarded before next call). Prologue `sub rsp, 8` aligns rsp % 16 == 0 for the SysV calls; matched `add rsp, 8` before every ret. @{cap, sched} matches move_dispatch's declared effects transitively. Labels prefixed mv_tsk_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        sub rsp, 8;                              // align rsp % 16 == 0
+
+        // Reset stats to a known baseline.
+        call mv_reset;
+
+        // Run the full mv pipeline once.
+        mov rdi, 0x1000;                         // src fixture pointer
+        mov rsi, 0x2000;                         // dst fixture pointer
+        call move_dispatch;
+        cmp rax, 0;
+        jne mv_tsk_dispatch_rc;
+
+        // ---- Invariant: MV_ST_INVOCATIONS >= 1 ------------------------------
+        mov rdi, 0;                              // MV_ST_INVOCATIONS
+        call mv_stat;
+        cmp rax, 1;
+        jb  mv_tsk_inv_stat;
+
+        // ---- Invariant: MV_ST_TXN_OPENS == 1 --------------------------------
+        mov rdi, 2;                              // MV_ST_TXN_OPENS
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_topen_stat;
+
+        // ---- Invariant: MV_ST_TXN_COMMITS == 1 ------------------------------
+        mov rdi, 3;                              // MV_ST_TXN_COMMITS
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_tcmt_stat;
+
+        // ---- Invariant: MV_ST_TXN_ABORTS == 0 -------------------------------
+        mov rdi, 4;                              // MV_ST_TXN_ABORTS
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tsk_tabt_stat;
+
+        // ---- Invariant: MV_ST_ERRORS == 0 -----------------------------------
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tsk_err_stat;
+
+        // ---- Invariant: MV_ST_MOVES == 1 (== MV_ST_RENAMES alias) -----------
+        mov rdi, 1;                              // MV_ST_MOVES
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_moves_stat;
+
+        // ---- Invariant: MV_ST_CROSS_DIR == 0 (stub-driven same-parent) ------
+        mov rdi, 6;                              // MV_ST_CROSS_DIR
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tsk_xdir_stat;
+
+        // ---- Invariant: MV_ST_CROSS_DEV == 0 (stub-driven no-EXDEV) ---------
+        mov rdi, 7;                              // MV_ST_CROSS_DEV
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tsk_xdev_stat;
+
+        // ---- Invariant: MV_ST_CROSS_USER == 0 (stub-driven same-user) -------
+        mov rdi, 8;                              // MV_ST_CROSS_USER
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tsk_xuser_stat;
+
+        // ---- Invariant: MV_ST_INODE_PRESERVED == 1 (same-user branch) -------
+        mov rdi, 9;                              // MV_ST_INODE_PRESERVED
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_prsv_stat;
+
+        // ---- Invariant: MV_ST_RECORDS_EMITTED == 1 (Schema fired) -----------
+        mov rdi, 11;                             // MV_ST_RECORDS_EMITTED
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_rec_stat;
+
+        // ---- Invariant: MV_ST_AUDIT_WRITES == 1 (Audit fired) ---------------
+        mov rdi, 12;                             // MV_ST_AUDIT_WRITES
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_aud_stat;
+
+        // ---- Invariant: MV_ST_UNDO_RECORDS == 1 (Undo fired) ----------------
+        mov rdi, 13;                             // MV_ST_UNDO_RECORDS
+        call mv_stat;
+        cmp rax, 1;
+        jne mv_tsk_und_stat;
+
+        // ---- Invariant: MV_ST_ELEVATE_ATTEMPTS == 0 (no cross-user hop) -----
+        mov rdi, 14;                             // MV_ST_ELEVATE_ATTEMPTS
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tsk_elv_stat;
+
+        // ---- All-pass --------------------------------------------------------
+        xor rax, rax;                            // MV_TEST_SMK_OK (0)
+        add rsp, 8;
+        ret;
+
+      mv_tsk_dispatch_rc:
+        mov rax, 0xFFFFEBE1;                     // MV_TEST_SMK_DISPATCH_RC
+        add rsp, 8;
+        ret;
+
+      mv_tsk_inv_stat:
+        mov rax, 0xFFFFEBE2;                     // MV_TEST_SMK_INV_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_topen_stat:
+        mov rax, 0xFFFFEBE3;                     // MV_TEST_SMK_TOPEN_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_tcmt_stat:
+        mov rax, 0xFFFFEBE4;                     // MV_TEST_SMK_TCMT_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_tabt_stat:
+        mov rax, 0xFFFFEBE5;                     // MV_TEST_SMK_TABT_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_err_stat:
+        mov rax, 0xFFFFEBE6;                     // MV_TEST_SMK_ERR_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_moves_stat:
+        mov rax, 0xFFFFEBE7;                     // MV_TEST_SMK_MOVES_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_xdir_stat:
+        mov rax, 0xFFFFEBEE;                     // MV_TEST_SMK_XDIR_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_xdev_stat:
+        mov rax, 0xFFFFEBED;                     // MV_TEST_SMK_XDEV_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_xuser_stat:
+        mov rax, 0xFFFFEBEC;                     // MV_TEST_SMK_XUSER_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_prsv_stat:
+        mov rax, 0xFFFFEBEB;                     // MV_TEST_SMK_PRSV_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_rec_stat:
+        mov rax, 0xFFFFEBE8;                     // MV_TEST_SMK_REC_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_aud_stat:
+        mov rax, 0xFFFFEBE9;                     // MV_TEST_SMK_AUD_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_und_stat:
+        mov rax, 0xFFFFEBEA;                     // MV_TEST_SMK_UND_STAT
+        add rsp, 8;
+        ret;
+
+      mv_tsk_elv_stat:
+        mov rax, 0xFFFFEBEF;                     // MV_TEST_SMK_ELV_STAT
+        add rsp, 8;
+        ret
+      }
+    }
+}

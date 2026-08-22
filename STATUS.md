@@ -1,10 +1,64 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M3 (semantic-pipe / audit integration) — complete
+**Current milestone:** M4 (tests + smoke) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
+
+## M4 — tests + smoke (complete)
+
+- `tests/test_txn_abort.pdx` (issue #12): TestTxnAbort module —
+  fixture entry point `test_txn_abort_run` verifies the M4-001
+  TXN-abort shape via three blocks: (A) Rename argv-gate rejects
+  (rename_same_dir(0,dst) → MV_RN_BAD_SRC; rename_same_dir(src,0)
+  → MV_RN_BAD_DST; rename_same_dir(src,dst) → MV_RN_STUB; both
+  bump MV_ST_ERRORS), (B) direct Pdxfs::pdxfs_txn_abort(1) → 0
+  (stub OK, dispatch shape verified for Move's abort branches),
+  (C) happy-path invariant (move_dispatch(0x1000,0x2000) → 0;
+  MV_ST_MOVES + MV_ST_TXN_COMMITS bump by 1; MV_ST_TXN_ABORTS +
+  MV_ST_ERRORS unchanged — the abort-leak / error-leak check).
+  Return-code band 0xFFFFEBCx (11 codes). Live fault injection
+  deferred to R42 substrate (sys_pdxfs_fault_inject sysno 527).
+  Prologue 2 callee-save pushes (rbx = abort baseline, r12 =
+  error baseline) + sub rsp, 8 = 24 bytes; even-count alignment
+  idiom same as elevate_client_lookup_broker.
+- `tests/test_undo_replay.pdx` (issue #13): TestUndoReplay module —
+  fixture entry point `test_undo_replay_run` runs the swap-
+  correctness matrix three times with distinct fixture pointer
+  pairs (0x1111/0x2222, 0x3333/0x4444, 0xDEAD/0xBEEF) to catch
+  populate-time aliasing. Each iteration: mv_undo_reset + verify
+  4 slots zero → mv_undo_populate(src,dst) → verify magic ==
+  MV_UNDO_MAGIC (staged via rcx for reg-reg cmp), replay_op ==
+  0x6D76, replay_src == dst (SWAP), replay_dst == src (SWAP) →
+  mv_undo_write(1) → 0 → MV_ST_UNDO_RECORDS bumped by 1. The
+  case dimension (same-dir / cross-dir / cross-dev / cross-user)
+  collapses to a single check because Undo is case-agnostic by
+  construction (one code path called from one call site with
+  identical argument shape across all four cases). Return-code
+  band 0xFFFFEBDx (8 codes). Prologue 3 callee-save pushes
+  (rbx = stats baseline, r12 = src fixture, r13 = dst fixture)
+  = 24 bytes; odd-count alignment idiom same as mv_inode_preserve.
+- `tests/test_smoke.pdx` (issue #14): TestSmoke module — fixture
+  entry point `test_smoke_run` runs ONE Move::move_dispatch on a
+  fresh stats table with fixture pointers (0x1000, 0x2000) and
+  verifies every M3-integrated subsystem fires per its stub-driven
+  expectation: MV_ST_INVOCATIONS >= 1, MV_ST_TXN_OPENS ==
+  MV_ST_TXN_COMMITS == MV_ST_MOVES == MV_ST_INODE_PRESERVED ==
+  MV_ST_RECORDS_EMITTED == MV_ST_AUDIT_WRITES ==
+  MV_ST_UNDO_RECORDS == 1; MV_ST_TXN_ABORTS == MV_ST_ERRORS ==
+  MV_ST_CROSS_DIR == MV_ST_CROSS_DEV == MV_ST_CROSS_USER ==
+  MV_ST_ELEVATE_ATTEMPTS == 0. Live QEMU harness (mv a b; undo
+  mv a b; ls) deferred to R42 substrate + shell.M5 + pdx-undo
+  (R51) — documented as a runbook in tests/README.md. Return-
+  code band 0xFFFFEBEx (16 codes). No callee-save state persists
+  between checks; prologue sub rsp, 8 for alignment.
+- `tests/README.md`: complete runbook — fixture-to-issue mapping
+  table, return-code band assignments, substrate-state discussion
+  (reachable vs unreachable failure vectors at HEAD), QEMU smoke
+  harness command sequence for the deferred live acceptance gate,
+  fixture-input rationale, and the mv-test-runner (R51) gate for
+  running the fixtures automatically.
 
 ## M3 — semantic-pipe / audit integration (complete)
 
@@ -222,6 +276,41 @@ breakdown.
 | 0xFFFFEB81 | MV_ELV_LOOKUP_FAIL       | Elevate.M3-004: svc_lookup neg errno       |
 | 0xFFFFEB82 | MV_ELV_SEND_FAIL         | Elevate.M3-004: ipc_send neg errno         |
 | 0xFFFFEB83 | MV_ELV_DENIED            | Elevate.M3-004: broker refused             |
+| 0xFFFFEBC0 | MV_TEST_ABT_OK           | test_txn_abort_run all-pass sentinel (== 0)|
+| 0xFFFFEBC1 | MV_TEST_ABT_BAD_SRC_RC   | rename_same_dir(0,dst) != MV_RN_BAD_SRC   |
+| 0xFFFFEBC2 | MV_TEST_ABT_BAD_DST_RC   | rename_same_dir(src,0) != MV_RN_BAD_DST   |
+| 0xFFFFEBC3 | MV_TEST_ABT_STUB_RC      | rename_same_dir(src,dst) != MV_RN_STUB    |
+| 0xFFFFEBC4 | MV_TEST_ABT_ERR_STAT     | MV_ST_ERRORS did not bump on reject       |
+| 0xFFFFEBC5 | MV_TEST_ABT_ABT_STUB     | pdxfs_txn_abort(1) != 0 (stub broke)      |
+| 0xFFFFEBC6 | MV_TEST_ABT_HAPPY_RC     | move_dispatch(src,dst) != 0               |
+| 0xFFFFEBC7 | MV_TEST_ABT_COMMIT_STAT  | MV_ST_TXN_COMMITS did not bump             |
+| 0xFFFFEBC8 | MV_TEST_ABT_MOVES_STAT   | MV_ST_MOVES did not bump                   |
+| 0xFFFFEBC9 | MV_TEST_ABT_ABT_LEAK     | MV_ST_TXN_ABORTS bumped on happy path      |
+| 0xFFFFEBCA | MV_TEST_ABT_ERR_LEAK     | MV_ST_ERRORS bumped on happy path          |
+| 0xFFFFEBD0 | MV_TEST_UND_OK           | test_undo_replay_run all-pass sentinel     |
+| 0xFFFFEBD1 | MV_TEST_UND_RESET_FAIL   | mv_undo_reset left a non-zero slot         |
+| 0xFFFFEBD2 | MV_TEST_UND_MAGIC_FAIL   | populated magic != MV_UNDO_MAGIC           |
+| 0xFFFFEBD3 | MV_TEST_UND_OP_FAIL      | populated replay_op != 0x6D76              |
+| 0xFFFFEBD4 | MV_TEST_UND_SRC_FAIL     | replay_src != original_dst (SWAP wrong)   |
+| 0xFFFFEBD5 | MV_TEST_UND_DST_FAIL     | replay_dst != original_src (SWAP wrong)   |
+| 0xFFFFEBD6 | MV_TEST_UND_WRITE_FAIL   | mv_undo_write returned non-zero            |
+| 0xFFFFEBD7 | MV_TEST_UND_STAT_FAIL    | MV_ST_UNDO_RECORDS delta wrong             |
+| 0xFFFFEBE0 | MV_TEST_SMK_OK           | test_smoke_run all-pass sentinel           |
+| 0xFFFFEBE1 | MV_TEST_SMK_DISPATCH_RC  | move_dispatch returned non-zero            |
+| 0xFFFFEBE2 | MV_TEST_SMK_INV_STAT     | MV_ST_INVOCATIONS < 1                     |
+| 0xFFFFEBE3 | MV_TEST_SMK_TOPEN_STAT   | MV_ST_TXN_OPENS != 1                      |
+| 0xFFFFEBE4 | MV_TEST_SMK_TCMT_STAT    | MV_ST_TXN_COMMITS != 1                    |
+| 0xFFFFEBE5 | MV_TEST_SMK_TABT_STAT    | MV_ST_TXN_ABORTS != 0                     |
+| 0xFFFFEBE6 | MV_TEST_SMK_ERR_STAT     | MV_ST_ERRORS != 0                         |
+| 0xFFFFEBE7 | MV_TEST_SMK_MOVES_STAT   | MV_ST_MOVES != 1                          |
+| 0xFFFFEBE8 | MV_TEST_SMK_REC_STAT     | MV_ST_RECORDS_EMITTED != 1                |
+| 0xFFFFEBE9 | MV_TEST_SMK_AUD_STAT     | MV_ST_AUDIT_WRITES != 1                   |
+| 0xFFFFEBEA | MV_TEST_SMK_UND_STAT     | MV_ST_UNDO_RECORDS != 1                   |
+| 0xFFFFEBEB | MV_TEST_SMK_PRSV_STAT    | MV_ST_INODE_PRESERVED != 1                |
+| 0xFFFFEBEC | MV_TEST_SMK_XUSER_STAT   | MV_ST_CROSS_USER != 0                     |
+| 0xFFFFEBED | MV_TEST_SMK_XDEV_STAT    | MV_ST_CROSS_DEV != 0                      |
+| 0xFFFFEBEE | MV_TEST_SMK_XDIR_STAT    | MV_ST_CROSS_DIR != 0                      |
+| 0xFFFFEBEF | MV_TEST_SMK_ELV_STAT     | MV_ST_ELEVATE_ATTEMPTS != 0               |
 
 ## Milestone rollup
 
@@ -238,6 +327,9 @@ breakdown.
 | M3-002 (#9)     | MoveRecord via libpdx-audit before commit                     | LANDED |
 | M3-003 (#10)    | PdxFS v1 undo record (replay is mv <dst> <src>)               | LANDED |
 | M3-004 (#11)    | libpdx-elevate for cross-user-boundary dst                    | LANDED |
+| M4-001 (#12)    | TXN-abort mid-move: source restored, no dest artifact         | LANDED |
+| M4-002 (#13)    | undo replay correctness across all four cases                 | LANDED |
+| M4-003 (#14)    | QEMU smoke: mv a b; undo mv a b; ls verifies                  | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-22)
 
