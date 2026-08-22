@@ -1,10 +1,69 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests + smoke) — complete
+**Current milestone:** M5 (signed 1.0 release) — M5-001 landed
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
+
+## M5 — signed 1.0 release (M5-001 landed; M5-002 pending)
+
+- `manifest.pdxsig` (issue #15): dual-signed package manifest at
+  repo root per `design/tooling/plan.md` §6.3 + §9.3. Format is
+  text header + two ML-DSA-65 signature stanzas. Header fields
+  are AUTHORITATIVE (name=mv, version=1.0.0, license=MIT,
+  wave=R50, milestone=M5, category=A/coreutils, priority=P0,
+  authored_by=paideia-os-team, released=2026-08-22). The
+  `[caps]` stanza names the six required caps from caps.decl.
+  The `[deps]` stanza names the five shared-library
+  dependencies from deps.list. The `[artifacts]` stanza names
+  every file shipped in pkg.tar with a per-file BLAKE3-256
+  digest slot. The `[schemas]` stanza names the MoveRecord[]
+  schema id (0x4D56, 64 bytes). The `[undo]` stanza names the
+  PdxFS v1 undo-record shape (magic 0x4D566E52, replay opcode
+  0x6D76, replay = mv <dst> <src>). Signature slots are
+  RESERVED with the SHAPE-PENDING pattern documented in
+  RELEASE.md — the two 3309-byte ML-DSA-65 signatures land
+  when T-INFRA-002 (signing bot + paideia_root_pk policy)
+  stands up. Every `sig_bytes` field carries the literal
+  `SHAPE-PENDING` and every fingerprint / digest carries the
+  `pending:<label>` marker so a downstream tool cannot mistake
+  the shape file for a valid one.
+- `deps.list` (issue #15): shared-library dependencies per
+  `design/tooling/plan.md` §6.3. Five entries in src/ file
+  order: libpdx-cap >= 1.0.0 (cap-manifest verify + signed-
+  inode helpers), libpdx-argv >= 1.0.0 (argv surface),
+  libpdx-semantic-pipe >= 1.0.0 (MoveRecord[] emit), libpdx-
+  audit >= 1.0.0 (user-events journal), libpdx-elevate >=
+  1.0.0 (cross-user broker hop). `pkg install mv` resolves
+  each against the semver constraint before staging.
+- `doc/mv.pdxdoc` (issue #15): man-equivalent read by `doc mv`
+  per I7 §2. Fifteen topics (.TOPIC synopsis / description /
+  options / exit_codes / caps / schemas / audit / undo /
+  ergonomics / posix / seealso / history / bugs / author /
+  license) covering the full user surface. Ergonomics topic
+  matches the D5 "five most common tasks" convention.
+  Differences-from-POSIX topic names the three axes on which
+  paideia-os mv diverges from POSIX mv (atomicity in all four
+  move shapes, audit journal before every op, WAL undo record
+  on commit).
+- `CHANGELOG.md` (issue #15): v1.0.0 entry naming the five
+  milestone rollups (M5 / M4 / M3 / M2 / M1), the upstream
+  substrate at landing (KIND_USER / KIND_IPC_ENDPOINT /
+  KIND_PDXFS_FILE / KIND_PDXFS_TXN / KIND_ELEVATE_CHANNEL),
+  and the four deferred-work items (live TXN dispatch on R42,
+  QEMU acceptance smoke on R42+shell.M5+pdx-undo, signing-bot
+  re-sign on T-INFRA-002, pkgs.paideia-os mirror on
+  T-INFRA-001).
+- `RELEASE.md` (issue #15): SHAPE-PENDING → LIVE handoff
+  runbook. Documents the §9.3 release flow, the regeneration
+  recipe when T-INFRA-002 lands (`paideia-as release --sign`
+  invocation), the verification recipe on the user side (`pkg
+  install mv` fails today; `pkg install --from-source mv`
+  works), the file-by-file M5 issue attribution, and the
+  reserved-for-future entries (1.0.1 for R42 substrate
+  landing; 1.0.0-signed for the identical tree with real
+  signatures).
 
 ## M4 — tests + smoke (complete)
 
@@ -330,6 +389,8 @@ breakdown.
 | M4-001 (#12)    | TXN-abort mid-move: source restored, no dest artifact         | LANDED |
 | M4-002 (#13)    | undo replay correctness across all four cases                 | LANDED |
 | M4-003 (#14)    | QEMU smoke: mv a b; undo mv a b; ls verifies                  | LANDED |
+| M5-001 (#15)    | dual-signed release + .pdxdoc                                 | LANDED |
+| M5-002 (#16)    | mirror push                                                   | PENDING |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-22)
 

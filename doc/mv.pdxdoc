@@ -1,0 +1,273 @@
+.PDXDOC 1
+.NAME    mv
+.VERSION 1.0.0
+.SUMMARY move / rename one path onto another with atomic PdxFS TXN + audit + undo
+.CAT     A/coreutils
+.WAVE    R50
+.DEFAULT_TOPIC synopsis
+
+.TOPIC synopsis
+.HEAD SYNOPSIS
+mv [-v|-i|--dry-run] <src> <dst>
+
+Move (or rename) SRC onto DST inside a single PdxFS v1 transaction.
+Success is atomic: at commit boundary the source dirent is gone and the
+destination dirent points at the same inode. Failure at any stage aborts
+the TXN, restoring the source and leaving no destination artifact.
+
+.TOPIC description
+.HEAD DESCRIPTION
+mv handles four move shapes inside one dispatch entry
+(Move::move_dispatch):
+
+  same-dir        src_parent == dst_parent -- one dirent rewrite in the
+                  shared parent, one TXN.
+
+  cross-dir       src_parent != dst_parent, same device -- unlink at
+                  src_parent + link at dst_parent, both threaded through
+                  ONE TXN (still atomic).
+
+  cross-device    src_parent and dst_parent live on different PdxFS
+                  volumes -- degrades to cp+rm inside the same outer
+                  TXN so the "atomic move" contract holds at commit
+                  boundary. --verbose surfaces was_cross_device on
+                  the diagnostic line.
+
+  cross-user      dst_parent's owning KIND_USER tail differs from
+                  src's inode tail -- Elevate::mv_elevate_cross_user
+                  performs a best-effort broker hop to re-sign the
+                  inode under the destination-user's key. A denied
+                  elevate falls through to graceful degrade: the
+                  inode keeps its old owner tail and a diagnostic
+                  records the degrade.
+
+Every successful mv emits ONE MoveRecord on the semantic pipe
+(schema id 0x4D56 "MV") carrying (src_path_ptr, dst_path_ptr,
+inode_id, was_rename, was_cross_device, was_cross_user, elevated)
+before any user-visible output leaves the process (D3 audit-first).
+The MoveRecord is journaled to /system/audit/user-events/ via
+libpdx-audit before the TXN commit; on the commit path Undo::
+mv_undo_write threads a PdxFS undo record whose replay is
+`mv <dst> <src>` -- pdx-undo (R51) reads it and reverses the op.
+
+.TOPIC options
+.HEAD OPTIONS
+  -v, --verbose      print `mv <src> <dst>` to stderr on success; adds
+                     was_cross_device / was_cross_user flags when set.
+
+  -i, --interactive  ask before overwriting an existing dst (M2 stub;
+                     live prompt lands with shell.M4 line reader
+                     accessible from within mv via KIND_TTY).
+
+      --dry-run      parse + validate + resolve parents; report the
+                     move-shape that WOULD run; do not open the TXN,
+                     do not emit a MoveRecord, do not journal.
+
+.TOPIC exit_codes
+.HEAD EXIT CODES
+Per I4 (design/tooling/plan.md), mv obeys the shared exit-code
+convention plus the mv-specific band 0xFFFFEBxx (high two bytes
+0xFFFFEB identify the mv layer to a downstream consumer):
+
+   0  success -- MoveRecord emitted, TXN committed, undo record
+                  threaded.
+   1  reserved -- mv has no "query returned nothing" outcome.
+   2  user error -- MV_ARG_* band (0xFFFFEB1x): unknown flag,
+                  wrong positional count, malformed argv.
+   3  system error -- MV_RN_* / MV_MV_* bands (0xFFFFEB2x /
+                  0xFFFFEB3x): TXN open refused, unlink failed,
+                  link failed, commit refused, cross-device
+                  fallback failed.
+   4  capability denied -- caller's InitCap sidecar missing one
+                  of the six caps in caps.decl (KIND_USER /
+                  KIND_IPC_ENDPOINT / KIND_PDXFS_FILE write on
+                  src-parent + dst-parent / KIND_PDXFS_TXN
+                  invoke+mint / KIND_ELEVATE_CHANNEL invoke).
+   5  signing / verification failure -- reserved; mv's manifest.
+                  pdxsig is verified by pkg at install time, not
+                  by mv itself.
+
+Full sub-band table lives in `design/architecture.md` §5.
+
+.TOPIC caps
+.HEAD CAPABILITIES
+mv declares six required caps in `caps.decl` (I6, refusable via
+--no-cap:<name>):
+
+  KIND_USER (self)                       identity root; mv reads
+                                         the caller's KIND_USER tail
+                                         before touching an inode.
+  KIND_IPC_ENDPOINT (invoke)             baseline pipe substrate
+                                         (R20b); MoveRecord[] emission
+                                         via libpdx-semantic-pipe.
+  KIND_PDXFS_FILE (write, <src-parent>)  write authority on the
+                                         directory holding src.
+  KIND_PDXFS_FILE (write, <dst-parent>)  write authority on the
+                                         directory that will hold
+                                         dst; same as src-parent for
+                                         same-dir rename.
+  KIND_PDXFS_TXN (invoke, mint)          transaction authority;
+                                         invoke for query on an open
+                                         TXN, mint to open a fresh
+                                         one.
+  KIND_ELEVATE_CHANNEL (invoke,          best-effort cross-user hop;
+    svc.elevate-broker)                  a denied elevate falls
+                                         through to graceful degrade.
+
+At startup mv prints the requested cap set to stderr unless --quiet
+(I6). --no-cap:<name> strips a cap; if the stripped cap is one of
+the two KIND_PDXFS_FILE writes or KIND_PDXFS_TXN, mv exits 4
+before any TXN is opened.
+
+.TOPIC schemas
+.HEAD OUTPUT SCHEMAS
+mv emits ONE typed schema on its semantic pipe:
+
+  MoveRecord[] (schema id 0x4D56 "MV", record size 64 bytes)
+    fields:
+      src_path_ptr    u64  caller-owned pointer to src argv slot
+      dst_path_ptr    u64  caller-owned pointer to dst argv slot
+      inode_id        u64  the moved inode's PdxFS id
+      was_rename      u8   1 if src_parent == dst_parent
+      was_cross_dev   u8   1 if the cross-device fallback fired
+      was_cross_user  u8   1 if dst_parent's owner != src's owner
+      elevated        u8   1 if the elevate hop succeeded
+      reserved        u32  zero
+      _pad            [u64; 3]  reserves the record at 64 bytes
+
+Downstream consumers filter, sort, or plot MoveRecord[] by any of
+these fields via the D2 semantic-pipe convention -- no column
+slicing.
+
+.TOPIC audit
+.HEAD AUDIT
+Every successful mv writes ONE user-events journal record via
+libpdx-audit before the TXN commit (D3 audit-first: an mv that
+cannot log itself is refused). The audit-journal broker name is
+`svc.audit-journal`; Audit::mv_audit_write_move builds the record
+in the caller-owned frame and dispatches it via sys_ipc_send
+(negative errno on send failure aborts the TXN).
+
+.TOPIC undo
+.HEAD UNDO
+On the commit path Undo::mv_undo_write threads a PdxFS v1 undo
+record (magic 0x4D566E52, replay opcode 0x6D76) whose fields are
+the swap:
+
+  replay_src  <-  dst
+  replay_dst  <-  src
+
+pdx-undo (R51) reads the record from the TXN's WAL tail and
+invokes `mv <replay_src> <replay_dst>`, restoring the pre-move
+state. Undo is best-effort at the write side -- an undo-write
+failure does NOT abort the TXN (the audit journal at M3-002
+still records the op so the operation is discoverable through
+journal-x even without the WAL undo).
+
+.TOPIC ergonomics
+.HEAD ERGONOMICS (D5)
+The five most common tasks mv serves, keystroke cost, failure
+protections, and recovery path:
+
+  1. rename in place        mv old.txt new.txt        11 keys
+     protection: unknown-flag reject, empty argv reject.
+     recovery:   pdx-undo restores old.txt.
+
+  2. move into subdir       mv file.txt sub/          15 keys
+     protection: dst_parent write cap enforced at exec;
+                 caller sees exit 4 before any TXN opens if
+                 sub/ is not writable.
+     recovery:   pdx-undo restores file.txt at repo root.
+
+  3. cross-volume move      mv file /mnt/other/       18 keys
+     protection: cross-device fallback (cp+rm) still atomic
+                 at commit boundary; TXN abort restores src.
+     recovery:   pdx-undo restores file at original path.
+
+  4. cross-user handoff     mv file ~otheruser/inbox/ 25 keys
+     protection: best-effort elevate hop re-signs the inode;
+                 a denied elevate falls through to graceful
+                 degrade (verbose diagnostic marks it).
+     recovery:   pdx-undo replays with elevate hop reversed.
+
+  5. dry-run preview        mv --dry-run a b          16 keys
+     protection: no TXN opens, no journal, no MoveRecord --
+                 pure validation surface.
+     recovery:   none required; nothing was done.
+
+.TOPIC posix
+.HEAD DIFFERENCES FROM POSIX mv
+The classic POSIX mv is a wrapper around rename(2) with a cp+rm
+fallback for cross-device moves. PaideiaOS mv differs on three
+axes:
+
+  atomicity        POSIX rename is atomic for same-dir + cross-dir
+                   on same device; cross-device is best-effort.
+                   PaideiaOS mv is atomic in all four cases via
+                   the single TXN + audit-first + undo-record
+                   discipline.
+
+  auditability     POSIX mv is silent about the operation once
+                   it returns. PaideiaOS mv journals a MoveRecord
+                   to /system/audit/user-events/ BEFORE the
+                   commit; journal-x (R51) surfaces it.
+
+  reversibility    POSIX mv is destructive at rename boundary --
+                   the source dirent is gone with no artifact.
+                   PaideiaOS mv threads a WAL undo record so
+                   pdx-undo replays the reverse mv.
+
+The POSIX flags -f (force) and -n (no-clobber) are covered by
+-i (interactive, M2 stub -- interactive prompt lands with the
+shell.M4 line reader accessible from within mv via KIND_TTY).
+POSIX -u (only-if-newer) is deferred to M6+ (no user demand at
+first-slice; a future refinement).
+
+.TOPIC seealso
+.HEAD SEE ALSO
+  doc cp             copy (peer coreutil; shares cross-device
+                     fallback module via libpdx-cap M3-002).
+  doc rm             remove (peer coreutil; shares
+                     libpdx-audit + libpdx-elevate integration).
+  doc mkdir          make directory (peer coreutil).
+  doc libpdx-cap     capability manifest + narrowing.
+  doc libpdx-audit   audit-journal client library.
+  doc libpdx-elevate elevate broker client library.
+  doc pdx-undo       undo-record replayer (R51).
+
+.TOPIC history
+.HEAD HISTORY
+  R49-R50   design filed at design/tooling/r49-r50-plan.md §5.7
+            in the paideia-os repo; issues #1-#16 filed against
+            paideia-os/mv covering M1-M5.
+  R50 M1    same-dir rename skeleton (issues #1-#3, LANDED
+            2026-08-21).
+  R50 M2    cross-dir + cross-device + signed-inode preservation
+            (issues #4-#7, LANDED 2026-08-21).
+  R50 M3    MoveRecord[] schema + libpdx-audit + PdxFS undo +
+            libpdx-elevate (issues #8-#11, LANDED 2026-08-22).
+  R50 M4    TXN-abort + undo replay + shape-smoke (issues
+            #12-#14, LANDED 2026-08-22).
+  R50 M5    dual-signed release + .pdxdoc + mirror push
+            (issues #15-#16, this release, 2026-08-22).
+
+.TOPIC bugs
+.HEAD KNOWN LIMITATIONS
+Every Pdxfs::* trampoline in this release is an M2 STUB (returns
+0 or 1 without issuing a syscall). Live TXN dispatch lands with
+the R42 PdxFS v1 substrate in the paideia-os kernel; the mv
+binary is source-complete + audit-complete + undo-complete at
+this release, but the QEMU acceptance smoke (mv a b; pdx-undo;
+ls) waits on R42 + shell.M5 + pdx-undo. See `tests/README.md`
+for the live-harness runbook and the fault-injection extension
+that lands as a Round-2 amendment when R42 closes.
+
+.TOPIC author
+.HEAD AUTHOR
+paideia-os-team.
+
+.TOPIC license
+.HEAD LICENSE
+MIT. See LICENSE at repo root.
+
+.END

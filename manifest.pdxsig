@@ -1,0 +1,133 @@
+.PDXSIG 1
+# ============================================================================
+# mv v1.0.0 -- dual-signed package manifest
+#
+# Format: text header + two ML-DSA-65 signature stanzas, per
+#   design/tooling/plan.md §6.3 + §9.3 in the paideia-os repo.
+#
+# STATUS AT LANDING (2026-08-22): SHAPE-PENDING. The header fields
+# are AUTHORITATIVE (name, version, deps, caps digest, .pdxdoc digest,
+# CHANGELOG digest, source tree fingerprint). The two ML-DSA-65
+# signature slots are RESERVED with the PENDING pattern documented in
+# RELEASE.md. Real signatures land when:
+#   * T-INFRA-002 (signing bot + paideia_root_pk policy) stands up,
+#   * `paideia-as release --sign` is available to compute the author
+#     signature over the header + pkg.tar,
+#   * the Paideia signing bot re-signs with the root key and moves
+#     the tuple into pkgs.paideia-os/main/mv/1.0.0/.
+# At that point THIS file is regenerated (headers unchanged; signature
+# stanzas replaced with the real ML-DSA-65 bytes); the SHAPE-PENDING
+# flag is cleared and the release is re-tagged (v1.0.0-signed).
+# ============================================================================
+
+[package]
+name          = mv
+version       = 1.0.0
+wave          = R50
+milestone     = M5
+category      = A/coreutils
+priority      = P0
+license       = MIT
+repository    = https://github.com/paideia-os/mv
+tag           = v1.0.0
+authored_by   = paideia-os-team
+released      = 2026-08-22
+
+[caps]
+# caps.decl fingerprint (BLAKE3-256 over the caps.decl file bytes at
+# release commit; verified by pkg install before staging). See
+# caps.decl at repo root for the required-cap list.
+required =
+  KIND_USER(self);
+  KIND_IPC_ENDPOINT(invoke);
+  KIND_PDXFS_FILE(write,<src-parent>);
+  KIND_PDXFS_FILE(write,<dst-parent>);
+  KIND_PDXFS_TXN(invoke,mint);
+  KIND_ELEVATE_CHANNEL(invoke,svc.elevate-broker)
+digest_alg    = blake3-256
+digest        = pending:caps-decl-blake3-256
+
+[deps]
+# Shared-library dependencies per deps.list; pkg install resolves
+# each against the semver constraint before staging.
+libpdx-cap           >= 1.0.0
+libpdx-argv          >= 1.0.0
+libpdx-semantic-pipe >= 1.0.0
+libpdx-audit         >= 1.0.0
+libpdx-elevate       >= 1.0.0
+
+[artifacts]
+# Files that ship in pkg.tar. Digests are BLAKE3-256 over each file's
+# bytes at the release commit. The [pkg_tar] digest is over the
+# concatenated pkg.tar bytes and is the value the author signature
+# covers (per §9.3).
+pkg_tar         = pending:pkg-tar-blake3-256
+doc/mv.pdxdoc   = pending:doc-mv-pdxdoc-blake3-256
+caps.decl       = pending:caps-decl-blake3-256
+deps.list       = pending:deps-list-blake3-256
+CHANGELOG.md    = pending:changelog-blake3-256
+src/mv.pdx       = pending:src-mv-blake3-256
+src/argv.pdx     = pending:src-argv-blake3-256
+src/rename.pdx   = pending:src-rename-blake3-256
+src/move.pdx     = pending:src-move-blake3-256
+src/inode.pdx    = pending:src-inode-blake3-256
+src/schema.pdx   = pending:src-schema-blake3-256
+src/audit.pdx    = pending:src-audit-blake3-256
+src/undo.pdx     = pending:src-undo-blake3-256
+src/elevate.pdx  = pending:src-elevate-blake3-256
+src/verbose.pdx  = pending:src-verbose-blake3-256
+src/pdxfs.pdx    = pending:src-pdxfs-blake3-256
+
+[schemas]
+# Semantic-pipe schemas mv emits (D2). Bound at M3-001 in src/schema.pdx.
+MoveRecord = 0x4D56  # 64 bytes; fields per doc/mv.pdxdoc .TOPIC schemas
+
+[undo]
+# PdxFS v1 undo record shape threaded by Undo::mv_undo_write on commit
+# (D3 audit-first + I5 destructive-op undo).
+magic         = 0x4D566E52
+replay_opcode = 0x6D76        # 'mv' in little-endian ASCII
+replay        = mv <dst> <src>
+
+# ============================================================================
+# Author signature (per §9.3 step 2 -- `paideia-as release --sign`)
+# ============================================================================
+[sig.author]
+alg        = ML-DSA-65
+key_id     = paideia-os-team
+key_fp     = pending:author-pk-fingerprint-blake3-256
+# ML-DSA-65 signature is 3309 bytes over the SHA3-512 of
+#   header_bytes || pkg_tar_bytes
+# where header_bytes is every line of THIS file above the first
+# [sig.*] stanza (line count check enforced by paideia-as release
+# --sign at compute time).
+sig_alg    = pkg-header-bytes || pkg_tar_bytes
+sig_bytes  = SHAPE-PENDING
+sig_note   = "author signature computed by `paideia-as release --sign` when the paideia-as toolchain reaches release-sign feature parity; scheduled with T-INFRA-002. Until then the source tag v1.0.0 is the interim distribution point."
+
+# ============================================================================
+# Root re-signature (per §9.3 step 4 -- Paideia signing bot)
+# ============================================================================
+[sig.root]
+alg        = ML-DSA-65
+key_id     = paideia_root_pk
+key_fp     = pending:paideia-root-pk-fingerprint-blake3-256
+sig_alg    = pkg-header-bytes || pkg_tar_bytes || author_sig_bytes
+sig_bytes  = SHAPE-PENDING
+sig_note   = "root re-signature computed by the Paideia signing bot after human-in-the-loop review confirms the source-tree at v1.0.0 matches the author's tag (per §9.3). Scheduled with T-INFRA-002."
+
+# ============================================================================
+# Verification policy (informational; enforced by pkg install)
+# ============================================================================
+[verify]
+# `pkg install mv` rejects if EITHER signature fails (D4).
+# `pkg install --from-source mv` skips the [sig.author] check on the
+# built binary (user built it themselves) but STILL verifies that the
+# source-tree root at v1.0.0 matches the author-signed commit unless
+# --trust-my-own-hash is passed.
+require_both_sigs  = true
+allow_from_source  = true
+from_source_flag   = --from-source
+override_flag      = --trust-my-own-hash
+
+.END

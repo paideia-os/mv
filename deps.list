@@ -1,0 +1,21 @@
+# mv/deps.list
+#
+# Shared-library dependencies per design/tooling/plan.md §6.3 + §7.
+# Each line names one library, its minimum required semver, and the
+# mv module(s) that link it. The `pkg install mv` resolver enforces
+# the semver constraints before staging the mv package tree under
+# /pkgs/mv-1.0.0/; a mismatch (missing or too-old library) is an
+# install-time exit 5 (signing/verification failure -- the manifest
+# no longer verifies against the installed substrate).
+#
+# Format: <name> <min-semver>  # <mv module(s)>
+#
+# Order matches src/ file order (mv, argv, rename, move, inode,
+# schema, audit, undo, elevate, verbose, pdxfs) so a reviewer can
+# cross-check module-level dependencies against link-list entries.
+
+libpdx-cap             1.0.0   # cap-manifest verify at exec + cap narrowing; src/mv.pdx + src/inode.pdx (signed-inode helpers)
+libpdx-argv            1.0.0   # argv surface + flag parse; src/argv.pdx
+libpdx-semantic-pipe   1.0.0   # MoveRecord[] schema emit; src/schema.pdx
+libpdx-audit           1.0.0   # user-events journal client; src/audit.pdx
+libpdx-elevate         1.0.0   # cross-user broker hop; src/elevate.pdx
