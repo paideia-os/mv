@@ -1,0 +1,342 @@
+// src/schema.pdx -- mv.M3-001 (paideia-os/mv#8)
+//
+// Schema module: MoveRecord[] schema binding + semantic-pipe emit.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M3-001 is the plan doc §5.7 M3 line's first landing:
+//
+//   "MoveRecord[] per file with `was_rename` and `was_cross_device`
+//    flags."
+//
+// M3 lifts mv from a return-code-only tool into a semantic-pipe
+// producer: every successful move emits ONE MoveRecord onto its
+// output pipe (D2 semantic-pipes). Downstream consumers can filter,
+// tally, or feed into an audit query without re-parsing stderr prose.
+//
+// This module owns:
+//
+//   * The MoveRecord fixed layout (a single 80-byte record;
+//     ten u64 fields at fixed offsets). One record per invocation
+//     because mv is a one-source-one-destination tool at M3.
+//   * A single .bss slot (mv_move_record) sized to hold the record.
+//   * mv_schema_reset() to clear the slot.
+//   * mv_schema_populate(src_ptr, dst_ptr) to fill the record from
+//     the Move module's per-invocation .bss (mv_move_src_parent /
+//     mv_move_dst_parent / mv_move_src_inode / mv_move_txn_handle /
+//     mv_move_was_cross_device / mv_move_was_cross_user).
+//     was_rename is derived from `src_parent == dst_parent`.
+//   * mv_schema_emit() to serialize the record to the semantic-pipe
+//     fd (fd 1 = stdout at M3; the R42 substrate landing will
+//     re-bind to a libpdx-semantic-pipe endpoint that carries the
+//     schema id in-band).
+//
+// The M3-002 audit hook and M3-003 undo hook consume the SAME record
+// slot: Audit::mv_audit_write_move reads mv_move_record and
+// forwards it to svc.audit-journal via sys_ipc_send; Undo::
+// mv_undo_populate derives its replay tuple (dst → src) from the
+// same buffer. Populate-once-consume-many keeps the assembly path
+// short and mirrors the ParsedArgs discipline in libpdx-argv.
+//
+// =============================================================================
+// SUBSTRATE STATE
+// =============================================================================
+//
+// libpdx-semantic-pipe (the crate that owns the schema-id-carrying
+// pipe envelope) is scheduled at wave R50 alongside mv itself; at
+// HEAD (2026-08-21) it is not yet in-tree. The M3-001 emit body
+// therefore forwards through the existing Pdxfs::pdxfs_write
+// trampoline (sys_write, fd 1). A downstream consumer sees an
+// 80-byte binary blob prefixed with the MOVE_RECORD_MAGIC constant
+// -- the schema id an eventual libpdx-semantic-pipe reader will
+// verify before decoding. When the crate lands, mv_schema_emit's
+// body flips to `libpdx_sempipe_emit(schema_id, record, len)`;
+// callers (currently only Move::move_dispatch) do not change.
+//
+// =============================================================================
+// RECORD LAYOUT (80 bytes; ten u64 fields; @align(8))
+// =============================================================================
+//
+//   Offset  Size  Field
+//        0     8  magic              = MOVE_RECORD_MAGIC (schema tag)
+//        8     8  was_rename         (1 iff src_parent == dst_parent)
+//       16     8  was_cross_device   (mirror of Move::mv_move_was_cross_device)
+//       24     8  was_cross_user     (mirror of Move::mv_move_was_cross_user)
+//       32     8  src_ptr            (NUL-terminated source path pointer)
+//       40     8  dst_ptr            (NUL-terminated destination path pointer)
+//       48     8  src_inode          (mirror of Move::mv_move_src_inode)
+//       56     8  src_parent         (mirror of Move::mv_move_src_parent)
+//       64     8  dst_parent         (mirror of Move::mv_move_dst_parent)
+//       72     8  txn_handle         (mirror of Move::mv_move_txn_handle)
+//
+// The path pointers are opaque (u64) -- downstream consumers that
+// care about the string values follow the pointers into the caller's
+// argv memory. mv does not own that memory and does not copy it into
+// the record. The R42 substrate landing will attach an inline
+// path-string trailer for consumers that survive past the caller's
+// argv lifetime; M3 consumers (audit, undo) both write their record
+// synchronously so pointer-into-argv is safe.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Schema`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0, 1, 80 appear).
+//   - Byte reads not used (record fields are u64; the buffer is a
+//     u64-strided store).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - mv_schema_reset + mv_schema_populate are LEAF functions
+//     (populate loads/stores u64s -- no nested SysV calls).
+//   - mv_schema_emit has one nested SysV call (pdxfs_write); prologue
+//     is `sub rsp, 8` to align rsp % 16 for the call.
+
+module Schema = structure {
+
+  // ==========================================================================
+  // Record layout constants
+  //
+  // Documentation only -- the emit + populate asm below uses literal
+  // integer offsets (paideia-as syntax accepts `[reg + imm]` with
+  // literal imm; named constants in operand positions are not part of
+  // the module-scope symbol resolution).
+  // ==========================================================================
+  pub let MV_MOVE_RECORD_SIZE  : u64 = 80
+
+  pub let MRO_MAGIC            : u64 = 0
+  pub let MRO_WAS_RENAME       : u64 = 8
+  pub let MRO_WAS_CROSS_DEVICE : u64 = 16
+  pub let MRO_WAS_CROSS_USER   : u64 = 24
+  pub let MRO_SRC_PTR          : u64 = 32
+  pub let MRO_DST_PTR          : u64 = 40
+  pub let MRO_SRC_INODE        : u64 = 48
+  pub let MRO_SRC_PARENT       : u64 = 56
+  pub let MRO_DST_PARENT       : u64 = 64
+  pub let MRO_TXN_HANDLE       : u64 = 72
+
+  // ==========================================================================
+  // MoveRecord magic / schema id
+  //
+  // High 32 bits = 0xFFFFEB50 (mv's Schema-band tag; sits in the M3
+  // schema band 0xFFFFEB5x). Low 32 bits = 0x00000001 (schema version
+  // 1). A downstream libpdx-semantic-pipe reader verifies this magic
+  // before decoding; a bump of the low 32 bits signals a layout change
+  // (add a field, widen a slot).
+  // ==========================================================================
+  pub let MV_MOVE_RECORD_MAGIC : u64 = 0xFFFFEB5000000001
+
+  // ==========================================================================
+  // Semantic-pipe fd for M3-001 stub emit
+  //
+  // fd 1 = stdout at M3 (libpdx-semantic-pipe not yet in-tree). The
+  // R50 pipe substrate landing swaps this to a schema-tagged endpoint
+  // fd; mv_schema_emit's body absorbs the change in one place.
+  // ==========================================================================
+  pub let MV_SEMPIPE_FD : u64 = 1
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEB5x (Schema layer)
+  //
+  //   0xFFFFEB50 MV_SCH_STUB          reserved / unused at M3-001
+  //   0xFFFFEB51 MV_SCH_EMIT_FAIL     pdxfs_write returned negative errno
+  //   0xFFFFEB52 MV_SCH_SHORT_WRITE   pdxfs_write returned < MV_MOVE_RECORD_SIZE
+  // ==========================================================================
+  pub let MV_SCH_STUB          : u64 = 0xFFFFEB50
+  pub let MV_SCH_EMIT_FAIL     : u64 = 0xFFFFEB51
+  pub let MV_SCH_SHORT_WRITE   : u64 = 0xFFFFEB52
+
+  // ==========================================================================
+  // Storage
+  //
+  // Single 80-byte record slot. @align(8) so the u64-strided populate
+  // stores are naturally aligned. Not @align(64) because the record
+  // is per-invocation state (populate-once-emit-once); no cache-line
+  // sharing concern the way _mv_stats has for its future SMP variant.
+  // ==========================================================================
+  pub let mut mv_move_record : [u8; 80] = uninit @align(8)
+
+  // ==========================================================================
+  // mv_schema_reset() -> ()
+  //
+  // Zero the ten u64 slots inside mv_move_record. Called from
+  // Move::move_dispatch at the top of a fresh invocation (before
+  // mv_schema_populate). Leaf; r11 scratch.
+  // ==========================================================================
+  pub let mv_schema_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M3-001 (#8): zero the ten-u64 mv_move_record buffer so a subsequent mv_schema_populate starts from a known-empty baseline. Ten `mov [r11 + off], rax` stores at offsets 0/8/16/24/32/40/48/56/64/72 (literal immediates, no named-constant operand resolution needed). Same idiom as mv_argv_reset (src/argv.pdx) and move_reset (src/move.pdx). r11 is scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 0], rax;
+        mov [r11 + 8], rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+        mov [r11 + 32], rax;
+        mov [r11 + 40], rax;
+        mov [r11 + 48], rax;
+        mov [r11 + 56], rax;
+        mov [r11 + 64], rax;
+        mov [r11 + 72], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_schema_populate(src_ptr, dst_ptr) -> ()
+  //
+  // Fill the MoveRecord slot from the caller's path pointers + the
+  // Move module's per-invocation .bss (mv_move_src_parent /
+  // mv_move_dst_parent / mv_move_src_inode / mv_move_txn_handle /
+  // mv_move_was_cross_device / mv_move_was_cross_user).
+  //
+  // was_rename is derived: `src_parent == dst_parent ? 1 : 0`.
+  //
+  // RDI (input): src_ptr -- NUL-terminated source path (preserved throughout)
+  // RSI (input): dst_ptr -- NUL-terminated destination path (preserved throughout)
+  //
+  // Register plan (leaf; no nested calls):
+  //   rdi, rsi = inputs (preserved through -- no callee to clobber them)
+  //   rax = load / store scratch
+  //   rcx = compare partner for was_rename derivation
+  //   r11 = LEA scratch (paideia-as reserved)
+  //
+  // No callee-save needed -- leaf function with no SysV calls.
+  // ==========================================================================
+  pub let mv_schema_populate : (u64, u64) -> () !{mem} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M3-001 (#8): populate the MoveRecord slot from Move::mv_move_* .bss + the two path pointers. Ten field stores at literal offsets 0/8/16/24/32/40/48/56/64/72; each field reads its source (mv_move_src_parent etc.) via `lea r11, [rip + sym]; mov rax, [r11]` then stores via `lea r11, [rip + mv_move_record]; mov [r11 + off], rax`. was_rename derivation: cmp mv_move_src_parent with mv_move_dst_parent and branch to a store-0 or store-1 arm. The path pointers rdi/rsi survive verbatim into the record slot -- no callee to clobber them, so the store `mov [r11 + 32], rdi` and `mov [r11 + 40], rsi` are direct writes from the arg registers. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only implicit zero via `cmp rax, rcx` here). r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. MOVE_RECORD_MAGIC is > 32-bit so it uses `mov r64, imm64` encoding (`mov rax, 0xFFFFEB5000000001`). Labels prefixed mv_sp_.",
+      block: {
+        // ---- Field 0: magic --------------------------------------------------
+        mov rax, 0xFFFFEB5000000001;                 // MV_MOVE_RECORD_MAGIC (imm64)
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 0], rax;
+
+        // ---- Field 8: was_rename = (src_parent == dst_parent) ? 1 : 0 --------
+        lea r11, [rip + mv_move_src_parent];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_dst_parent];
+        mov rcx, [r11];
+        cmp rax, rcx;
+        jne mv_sp_rn_zero;
+        mov rax, 1;
+        jmp mv_sp_rn_store;
+      mv_sp_rn_zero:
+        xor rax, rax;
+      mv_sp_rn_store:
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 8], rax;
+
+        // ---- Field 16: was_cross_device --------------------------------------
+        lea r11, [rip + mv_move_was_cross_device];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 16], rax;
+
+        // ---- Field 24: was_cross_user ----------------------------------------
+        lea r11, [rip + mv_move_was_cross_user];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 24], rax;
+
+        // ---- Field 32: src_ptr (from rdi) ------------------------------------
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 32], rdi;
+
+        // ---- Field 40: dst_ptr (from rsi) ------------------------------------
+        mov [r11 + 40], rsi;
+
+        // ---- Field 48: src_inode ---------------------------------------------
+        lea r11, [rip + mv_move_src_inode];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 48], rax;
+
+        // ---- Field 56: src_parent --------------------------------------------
+        lea r11, [rip + mv_move_src_parent];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 56], rax;
+
+        // ---- Field 64: dst_parent --------------------------------------------
+        lea r11, [rip + mv_move_dst_parent];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 64], rax;
+
+        // ---- Field 72: txn_handle --------------------------------------------
+        lea r11, [rip + mv_move_txn_handle];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 72], rax;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_schema_emit() -> u64
+  //
+  // Serialize the mv_move_record buffer to the semantic-pipe fd
+  // (MV_SEMPIPE_FD == 1 at M3 stub; a libpdx-semantic-pipe endpoint
+  // handle in the R50 substrate landing).
+  //
+  // Return:
+  //   0                     on success
+  //   MV_SCH_EMIT_FAIL      pdxfs_write returned negative errno
+  //   MV_SCH_SHORT_WRITE    pdxfs_write returned < 80 bytes
+  //
+  // Bumps MV_ST_RECORDS_EMITTED (slot 11) on success. Best-effort
+  // from the caller's perspective -- Move::move_dispatch treats an
+  // emit failure as an audit-hint miss, not a correctness failure
+  // (the move itself is still committed atomically by the outer TXN).
+  //
+  // No inputs. One nested SysV call (pdxfs_write). Prologue `sub
+  // rsp, 8` to align rsp % 16 == 0 for the call. r11 scratch.
+  // ==========================================================================
+  pub let mv_schema_emit : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M3-001 (#8): serialize the populated MoveRecord to the semantic-pipe fd. M3-001 stub emits to fd 1 (stdout) via Pdxfs::pdxfs_write; the R50 libpdx-semantic-pipe landing swaps the fd + wraps the payload with a schema-tagged envelope. Single nested SysV call; entry rsp % 16 == 8 + sub 8 = 0 for the call. `cmp rax, 0; jl fail` catches negative errno; `cmp rax, 80; jl short_write` catches partial write (80 fits imm32 window). On success bumps MV_ST_RECORDS_EMITTED (slot 11) via mv_note; on any failure bumps MV_ST_ERRORS (slot 5). Best-effort from caller's view -- move_dispatch does not gate commit on this. Labels prefixed mv_se_.",
+      block: {
+        sub rsp, 8;                                  // align rsp % 16 == 0 for pdxfs_write
+
+        mov rdi, 1;                                  // MV_SEMPIPE_FD (stdout at M3 stub)
+        lea rsi, [rip + mv_move_record];             // buf
+        mov rdx, 80;                                 // MV_MOVE_RECORD_SIZE
+        call pdxfs_write;
+
+        cmp rax, 0;
+        jl  mv_se_emit_fail;                         // negative errno
+
+        cmp rax, 80;
+        jl  mv_se_short_write;                       // partial write
+
+        // Success: bump MV_ST_RECORDS_EMITTED and return 0.
+        mov rdi, 11;                                 // MV_ST_RECORDS_EMITTED
+        call mv_note;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      mv_se_emit_fail:
+        mov rdi, 5;                                  // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB51;                         // MV_SCH_EMIT_FAIL
+        add rsp, 8;
+        ret;
+
+      mv_se_short_write:
+        mov rdi, 5;                                  // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB52;                         // MV_SCH_SHORT_WRITE
+        add rsp, 8;
+        ret
+      }
+    }
+}

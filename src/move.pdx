@@ -554,6 +554,21 @@ module Move = structure {
         mov rsi, r14;                        // dst_parent (in r14)
         call mv_inode_preserve;
 
+        // ---- Step 6d (M3-001): MoveRecord semantic-pipe emit ----------------
+        // Populate + emit BEFORE the commit so the audit-first
+        // discipline (D3) is satisfied even if the commit fails
+        // mid-drain: the downstream schema consumer records the intent
+        // and the audit journal (M3-002) records the record; a failed
+        // commit leaves the source dirent intact (WAL rollback) and
+        // the emitted record's `txn_handle` field lets a consumer
+        // correlate the failure to the specific PdxFS TXN state.
+        // Emit failure is best-effort -- it does not gate the commit.
+        call mv_schema_reset;
+        mov rdi, rbx;                        // src_ptr
+        mov rsi, r12;                        // dst_ptr
+        call mv_schema_populate;
+        call mv_schema_emit;
+
         // ---- Step 7: commit TXN ---------------------------------------------
         mov rdi, r15;                        // txn
         call pdxfs_txn_commit;

@@ -1,12 +1,31 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — complete
+**Current milestone:** M3 (semantic-pipe / audit integration) — in progress
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
 
-## M2 — core implementation (in progress)
+## M3 — semantic-pipe / audit integration (in progress)
+
+- `src/schema.pdx` (issue #8): Schema module — MoveRecord[] fixed
+  layout (80 bytes; ten u64 fields at documented offsets) with
+  MOVE_RECORD_MAGIC schema id 0xFFFFEB5000000001. `mv_schema_reset`
+  clears the 80-byte .bss slot; `mv_schema_populate(src, dst)` fills
+  it from the Move module's per-invocation .bss + the two path
+  pointers (was_rename derived from src_parent == dst_parent);
+  `mv_schema_emit` writes it to the semantic-pipe fd (fd 1 stub at
+  M3; a libpdx-semantic-pipe endpoint when the crate lands at R50).
+  Return-code band 0xFFFFEB5x (MV_SCH_EMIT_FAIL / MV_SCH_SHORT_WRITE).
+  Adds MV_ST_RECORDS_EMITTED (slot 11).
+- `src/move.pdx` (issue #8): Move::move_dispatch calls
+  mv_schema_reset + mv_schema_populate + mv_schema_emit AFTER
+  mv_inode_preserve but BEFORE pdxfs_txn_commit so the schema
+  emission satisfies D3 audit-first (the record is observable even
+  if the commit fails mid-drain; the emitted txn_handle field lets
+  a consumer correlate to PdxFS TXN state).
+
+## M2 — core implementation (complete)
 
 - `src/pdxfs.pdx` (issue #4): Pdxfs module — eight userspace
   syscall trampolines for the PdxFS v1 txn substrate
@@ -132,6 +151,9 @@ breakdown.
 | 0xFFFFEB3B | MV_MV_XDEV_WRITE_FAIL    | cross-dev fallback: sys_write failed      |
 | 0xFFFFEB3C | MV_MV_XDEV_SHORT_WRITE   | cross-dev fallback: short write           |
 | 0xFFFFEB3D | MV_MV_XDEV_UNLINK_FAIL   | cross-dev fallback: pdxfs_unlink refused  |
+| 0xFFFFEB50 | MV_SCH_STUB              | Schema.M3-001: reserved                    |
+| 0xFFFFEB51 | MV_SCH_EMIT_FAIL         | Schema.M3-001: pdxfs_write neg errno       |
+| 0xFFFFEB52 | MV_SCH_SHORT_WRITE       | Schema.M3-001: pdxfs_write short           |
 
 ## Milestone rollup
 
@@ -144,6 +166,7 @@ breakdown.
 | M2-002 (#5)     | cross-device move via cp+rm internal fallback                 | LANDED |
 | M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | LANDED |
 | M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | LANDED |
+| M3-001 (#8)     | MoveRecord[] schema bind (was_rename, was_cross_device flags) | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

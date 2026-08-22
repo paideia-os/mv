@@ -158,6 +158,12 @@ module Mv = structure {
   // sign policy) has a well-known slot.
   pub let MV_MV_INODE_STUB         : u64 = 0xFFFFEB40   // reserved
 
+  // Schema / semantic-pipe (M3-001) codes (0xFFFFEB5x). MoveRecord[]
+  // schema emit failures. Bodies live in src/schema.pdx (module Schema).
+  pub let MV_SCH_STUB              : u64 = 0xFFFFEB50   // reserved
+  pub let MV_SCH_EMIT_FAIL         : u64 = 0xFFFFEB51   // pdxfs_write returned negative errno
+  pub let MV_SCH_SHORT_WRITE       : u64 = 0xFFFFEB52   // pdxfs_write returned < MV_MOVE_RECORD_SIZE
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
@@ -180,7 +186,8 @@ module Mv = structure {
   //   8 MV_ST_CROSS_USER        (M2-004) cross-user graceful degrade count
   //   9 MV_ST_INODE_PRESERVED   (M2-004) signed-inode preserve successes
   //  10 MV_ST_INODE_REKEYED     (M2-004) signed-inode re-sign successes
-  //  11..15 reserved             for M3
+  //  11 MV_ST_RECORDS_EMITTED   (M3-001) Schema::mv_schema_emit successes
+  //  12..15 reserved             for M3-002..M3-004
   //
   // Cache-line alignment matches _shell_stats / _elevate_broker_stats
   // -- keeps a future SMP counter path a mechanical widening rather
@@ -200,6 +207,7 @@ module Mv = structure {
   pub let MV_ST_CROSS_USER       : u64 = 8
   pub let MV_ST_INODE_PRESERVED  : u64 = 9
   pub let MV_ST_INODE_REKEYED    : u64 = 10
+  pub let MV_ST_RECORDS_EMITTED  : u64 = 11
   pub let MV_ST_MAX              : u64 = 16
 
   // ==========================================================================
