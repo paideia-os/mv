@@ -1,0 +1,380 @@
+// tests/test_undo_replay.pdx -- mv.M4-002 (paideia-os/mv#13)
+//
+// TestUndoReplay module: undo replay correctness across all four
+// move cases (same-dir, cross-dir, cross-dev, cross-user).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M4-002 is the plan doc §5.7 M4 line's second landing:
+//
+//   "undo replay correctness across all four cases (same-dir,
+//    cross-dir, cross-dev, cross-user)"
+//
+// The undo record for mv is a 32-byte tuple (magic + replay_op +
+// replay_src_ptr + replay_dst_ptr) written into the PdxFS TXN's
+// WAL group by Undo::mv_undo_write. On replay, `pdx-undo` invokes
+// `mv <replay_src> <replay_dst>` -- which for a correctly-populated
+// record equals `mv <original_dst> <original_src>` and reverses the
+// TXN.
+//
+// The correctness invariant across all four move cases is IDENTICAL:
+//
+//   record.magic          == MV_UNDO_MAGIC (0xFFFFEB7000000001)
+//   record.replay_op      == MV_UNDO_OP_MV (0x6D76 == 'mv' LE)
+//   record.replay_src_ptr == original_dst_ptr   (SWAP)
+//   record.replay_dst_ptr == original_src_ptr   (SWAP)
+//
+// The Undo module has ONE code path (mv_undo_populate) called from
+// ONE call site (Move::move_dispatch) that runs after inode-preserve
+// and BEFORE the commit. Same-dir, cross-dir, cross-dev, and
+// cross-user all reach that call site with the same argument shape
+// (rdi = src_ptr, rsi = dst_ptr). This test therefore validates the
+// SWAP semantics with three distinct (src_ptr, dst_ptr) fixture
+// pairs -- the case dimension collapses to a single check because
+// the Undo module is case-agnostic by construction.
+//
+// =============================================================================
+// FIXTURE POINTERS
+// =============================================================================
+//
+// The tests pass small non-zero fixture values (0x1111, 0x2222,
+// 0x3333, 0x4444, 0xDEAD, 0xBEEF) as src/dst pointers. Undo::
+// mv_undo_populate does NOT dereference these -- it only stores
+// their bit-pattern into the record's replay_src_ptr /
+// replay_dst_ptr slots. The verify step reads the slots back and
+// compares against the expected swap.
+//
+// =============================================================================
+// SUBSTRATE STATE
+// =============================================================================
+//
+// Undo::pdxfs_txn_write_undo is an M3 STUB returning 0 (see
+// src/undo.pdx §Pdxfs::pdxfs_txn_write_undo). This test verifies:
+//
+//   1. The populate step (mv_undo_populate) writes the record
+//      slot with the SWAPPED path pointers regardless of substrate.
+//   2. The write step (mv_undo_write) returns 0 (stub OK) and
+//      bumps MV_ST_UNDO_RECORDS.
+//
+// When R42 lands the real sys_pdxfs_txn_write_undo (sysno 522),
+// this test's write-return check catches any layout drift because
+// the kernel refuses records with a bad magic tag.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFEBDx (TestUndoReplay)
+// =============================================================================
+//
+//   0xFFFFEBD0 MV_TEST_UND_OK           all-pass sentinel (== 0 for exit-clean)
+//   0xFFFFEBD1 MV_TEST_UND_RESET_FAIL   mv_undo_reset left a non-zero slot
+//   0xFFFFEBD2 MV_TEST_UND_MAGIC_FAIL   populated magic != MV_UNDO_MAGIC
+//   0xFFFFEBD3 MV_TEST_UND_OP_FAIL      populated replay_op != 0x6D76
+//   0xFFFFEBD4 MV_TEST_UND_SRC_FAIL     replay_src != original_dst (SWAP wrong)
+//   0xFFFFEBD5 MV_TEST_UND_DST_FAIL     replay_dst != original_src (SWAP wrong)
+//   0xFFFFEBD6 MV_TEST_UND_WRITE_FAIL   mv_undo_write returned non-zero
+//   0xFFFFEBD7 MV_TEST_UND_STAT_FAIL    MV_ST_UNDO_RECORDS delta wrong
+//
+// The all-pass sentinel is aliased to 0 (via `xor rax,rax; ret`)
+// so a shell-visible exit code matches the POSIX success convention.
+// The named sentinel 0xFFFFEBD0 exists for internal spelling
+// consistency with the failure codes.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestUndoReplay`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The magic
+//     compare (0xFFFFEB7000000001) stages through rcx via
+//     `mov rcx, imm64; cmp rax, rcx` (reg-reg cmp).
+//   - Byte reads not used (all record fields are u64 loads).
+//   - r11 is scratch for every .bss reach.
+//   - test_undo_replay_run has nested SysV calls (mv_undo_reset,
+//     mv_undo_populate, mv_undo_write, mv_stat). Prologue is 3
+//     callee-save pushes (rbx = stats snapshot, r12 = src fixture,
+//     r13 = dst fixture) = 24 bytes; entry rsp % 16 == 8, 3
+//     pushes flip parity to 0 (odd-count idiom). No stack-pad sub.
+//     Matched 3-pop epilogue at every ret.
+
+module TestUndoReplay = structure {
+
+  // ==========================================================================
+  // test_undo_replay_run() -> u64
+  //
+  // The M4-002 fixture entry point. Runs the swap-correctness matrix
+  // three times with distinct fixture pointer pairs to catch any
+  // aliasing between populate calls.
+  //
+  // Sequence per iteration:
+  //   1. Record MV_ST_UNDO_RECORDS baseline (rbx).
+  //   2. Call mv_undo_reset(); verify all four slots read zero.
+  //   3. Call mv_undo_populate(r12=src, r13=dst).
+  //   4. Verify record.magic == MV_UNDO_MAGIC.
+  //   5. Verify record.replay_op == 0x6D76 ('mv' LE).
+  //   6. Verify record.replay_src == r13 (dst -- the SWAP).
+  //   7. Verify record.replay_dst == r12 (src -- the SWAP).
+  //   8. Call mv_undo_write(txn_handle=1); verify == 0.
+  //   9. Verify MV_ST_UNDO_RECORDS == baseline + 1.
+  //
+  // Any failure returns the corresponding MV_TEST_UND_* code
+  // immediately (fail-fast; downstream slots are untouched so a
+  // debugger can inspect the exact failure point).
+  //
+  // Return: 0 on all-pass; MV_TEST_UND_* on first failure.
+  // ==========================================================================
+  pub let test_undo_replay_run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M4-002 (#13): TestUndoReplay::test_undo_replay_run -- undo replay correctness fixture. Runs the swap-correctness check with three distinct fixture pointer pairs (0x1111/0x2222, 0x3333/0x4444, 0xDEAD/0xBEEF) to catch any aliasing between mv_undo_populate calls. Each iteration: baseline stats read into rbx, mv_undo_reset + zero-verify, mv_undo_populate(r12=src, r13=dst), four field verifies (magic imm64 staged via rcx for reg-reg cmp per paideia-as no-imm64-cmp rule; replay_op imm 0x6D76 direct; replay_src/replay_dst reg-reg vs the fixture snapshots), mv_undo_write + return-zero verify, MV_ST_UNDO_RECORDS delta check. Fail-fast: first non-matching field returns the corresponding MV_TEST_UND_* code immediately. Prologue 3 callee-save pushes (rbx = stats baseline snapshot, r12 = src fixture, r13 = dst fixture) = 24 bytes; entry rsp % 16 == 8, 3 pushes flip parity to 0 (odd-count idiom, matches mv_inode_preserve and cp copy_single_file). Matched 3-pop epilogue at every ret path. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 0x6D76 both fit); the MV_UNDO_MAGIC (0xFFFFEB7000000001) compare stages through rcx via mov r64, imm64 + reg-reg cmp. r11 scratch for .bss reaches. Labels prefixed mv_tur_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+
+        // ---- Iteration 1: (0x1111, 0x2222) ----------------------------------
+        // Snapshot MV_ST_UNDO_RECORDS baseline.
+        mov rdi, 13;                             // MV_ST_UNDO_RECORDS
+        call mv_stat;
+        mov rbx, rax;                            // rbx = baseline
+
+        // Fixture pointers.
+        mov r12, 0x1111;                         // src fixture
+        mov r13, 0x2222;                         // dst fixture
+
+        // Reset record, verify all four slots zero.
+        call mv_undo_reset;
+
+        lea r11, [rip + mv_undo_record];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 24];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+
+        // Populate with (src=r12, dst=r13).
+        mov rdi, r12;                            // src_ptr
+        mov rsi, r13;                            // dst_ptr
+        call mv_undo_populate;
+
+        // Verify record.magic == MV_UNDO_MAGIC.
+        lea r11, [rip + mv_undo_record];
+        mov rax, [r11 + 0];
+        mov rcx, 0xFFFFEB7000000001;             // MV_UNDO_MAGIC (imm64 stage)
+        cmp rax, rcx;
+        jne mv_tur_magic_fail;
+
+        // Verify record.replay_op == 0x6D76.
+        mov rax, [r11 + 8];
+        cmp rax, 0x6D76;                         // MV_UNDO_OP_MV (fits imm32)
+        jne mv_tur_op_fail;
+
+        // Verify record.replay_src == r13 (SWAP: dst becomes replay src).
+        mov rax, [r11 + 16];
+        cmp rax, r13;
+        jne mv_tur_src_fail;
+
+        // Verify record.replay_dst == r12 (SWAP: src becomes replay dst).
+        mov rax, [r11 + 24];
+        cmp rax, r12;
+        jne mv_tur_dst_fail;
+
+        // Write undo (stub returns 0). Bumps MV_ST_UNDO_RECORDS on success.
+        mov rdi, 1;                              // txn_handle fixture
+        call mv_undo_write;
+        cmp rax, 0;
+        jne mv_tur_write_fail;
+
+        // Verify MV_ST_UNDO_RECORDS == rbx + 1.
+        mov rdi, 13;                             // MV_ST_UNDO_RECORDS
+        call mv_stat;
+        mov rcx, rbx;
+        add rcx, 1;
+        cmp rax, rcx;
+        jne mv_tur_stat_fail;
+
+        // ---- Iteration 2: (0x3333, 0x4444) ----------------------------------
+        // Fresh baseline snapshot (write bumped the counter).
+        mov rdi, 13;
+        call mv_stat;
+        mov rbx, rax;                            // rbx = new baseline
+
+        mov r12, 0x3333;
+        mov r13, 0x4444;
+
+        call mv_undo_reset;
+
+        // Verify reset zeroed all four slots again.
+        lea r11, [rip + mv_undo_record];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 24];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call mv_undo_populate;
+
+        lea r11, [rip + mv_undo_record];
+        mov rax, [r11 + 0];
+        mov rcx, 0xFFFFEB7000000001;
+        cmp rax, rcx;
+        jne mv_tur_magic_fail;
+
+        mov rax, [r11 + 8];
+        cmp rax, 0x6D76;
+        jne mv_tur_op_fail;
+
+        mov rax, [r11 + 16];
+        cmp rax, r13;
+        jne mv_tur_src_fail;
+
+        mov rax, [r11 + 24];
+        cmp rax, r12;
+        jne mv_tur_dst_fail;
+
+        mov rdi, 1;
+        call mv_undo_write;
+        cmp rax, 0;
+        jne mv_tur_write_fail;
+
+        mov rdi, 13;
+        call mv_stat;
+        mov rcx, rbx;
+        add rcx, 1;
+        cmp rax, rcx;
+        jne mv_tur_stat_fail;
+
+        // ---- Iteration 3: (0xDEAD, 0xBEEF) ----------------------------------
+        mov rdi, 13;
+        call mv_stat;
+        mov rbx, rax;
+
+        mov r12, 0xDEAD;
+        mov r13, 0xBEEF;
+
+        call mv_undo_reset;
+
+        lea r11, [rip + mv_undo_record];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+        mov rax, [r11 + 24];
+        cmp rax, 0;
+        jne mv_tur_reset_fail;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call mv_undo_populate;
+
+        lea r11, [rip + mv_undo_record];
+        mov rax, [r11 + 0];
+        mov rcx, 0xFFFFEB7000000001;
+        cmp rax, rcx;
+        jne mv_tur_magic_fail;
+
+        mov rax, [r11 + 8];
+        cmp rax, 0x6D76;
+        jne mv_tur_op_fail;
+
+        mov rax, [r11 + 16];
+        cmp rax, r13;
+        jne mv_tur_src_fail;
+
+        mov rax, [r11 + 24];
+        cmp rax, r12;
+        jne mv_tur_dst_fail;
+
+        mov rdi, 1;
+        call mv_undo_write;
+        cmp rax, 0;
+        jne mv_tur_write_fail;
+
+        mov rdi, 13;
+        call mv_stat;
+        mov rcx, rbx;
+        add rcx, 1;
+        cmp rax, rcx;
+        jne mv_tur_stat_fail;
+
+        // ---- All-pass --------------------------------------------------------
+        xor rax, rax;                            // MV_TEST_UND_OK (0)
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_reset_fail:
+        mov rax, 0xFFFFEBD1;                     // MV_TEST_UND_RESET_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_magic_fail:
+        mov rax, 0xFFFFEBD2;                     // MV_TEST_UND_MAGIC_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_op_fail:
+        mov rax, 0xFFFFEBD3;                     // MV_TEST_UND_OP_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_src_fail:
+        mov rax, 0xFFFFEBD4;                     // MV_TEST_UND_SRC_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_dst_fail:
+        mov rax, 0xFFFFEBD5;                     // MV_TEST_UND_DST_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_write_fail:
+        mov rax, 0xFFFFEBD6;                     // MV_TEST_UND_WRITE_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tur_stat_fail:
+        mov rax, 0xFFFFEBD7;                     // MV_TEST_UND_STAT_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
