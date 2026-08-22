@@ -1,0 +1,80 @@
+# mv — caps.decl
+#
+# Wave: R50 (Wave 2)
+# Doc:  design/tooling/r49-r50-plan.md §5.7 in the paideia-os repo.
+#
+# mv moves one path onto another. Every M1 invocation degenerates to
+# a same-directory rename — src and dst share a parent, so the two
+# write authorities collapse into ONE KIND_PDXFS_FILE(write, <parent>).
+# M2 splits the two out again for the cross-directory case (rename
+# opens ONE TXN that touches BOTH parents; the caps.decl still names
+# them separately so exec-time cap_manifest_verify catches a caller
+# that forgot to hand down one side or the other).
+#
+# The M1 baseline is:
+#
+#   * KIND_USER (self)             — identity root. mv checks the
+#                                    caller's KIND_USER tail before it
+#                                    touches an inode (D3 audit-first,
+#                                    R48.M1 KIND_USER = 0x190 substrate
+#                                    at paideia-os
+#                                    src/kernel/core/cap/kind_user.pdx).
+#
+#   * KIND_IPC_ENDPOINT (invoke)   — baseline pipe substrate (R20b,
+#                                    base kind 5). Consumers use it
+#                                    for stdout/stderr rendering. M3
+#                                    wires libpdx-semantic-pipe on top
+#                                    for MoveRecord[] emission.
+#
+#   * KIND_PDXFS_FILE(write, <src-parent>) — write authority on the
+#                                    directory that holds src. M1 uses
+#                                    it to unlink the source dirent
+#                                    inside the TXN.
+#                                    KIND_PDXFS_FILE = 0x195 (R42
+#                                    substrate, landed in paideia-os
+#                                    commit 411ad0e).
+#
+#   * KIND_PDXFS_FILE(write, <dst-parent>) — write authority on the
+#                                    directory that will hold dst. M1
+#                                    uses it to link the target dirent
+#                                    inside the SAME TXN. For same-dir
+#                                    rename src-parent == dst-parent
+#                                    and the two caps refer to the
+#                                    same underlying dir inode; the
+#                                    caps.decl still names them
+#                                    separately so M2's cross-dir path
+#                                    is a code change, not a manifest
+#                                    change.
+#
+#   * KIND_PDXFS_TXN (invoke, mint) — transaction authority so mv can
+#                                    open one TXN, thread the unlink
+#                                    + link through it, and commit
+#                                    atomically. invoke is used for
+#                                    query ops on an existing txn;
+#                                    mint is what mv needs to open a
+#                                    new one at invocation.
+#                                    KIND_PDXFS_TXN = 0x196 (R42
+#                                    substrate).
+#
+# --- placeholder: elevate-broker binding -------------------------------
+# Reserved for the M3-004 wire-up (cross-user-boundary destination).
+# Uncomment when libpdx-elevate.M3 is in-tree and the paideia-os
+# elevate broker (R48.M7 at src/kernel/core/ipc/elevate_broker.pdx)
+# is running. M1's mv never crosses user boundaries — a mv onto a
+# path whose parent belongs to another user is refused with
+# MV_ARG_UNSUP at exec until M3.
+#
+#   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
+requires:
+  - KIND_USER (self)
+  - KIND_IPC_ENDPOINT (invoke)
+  - KIND_PDXFS_FILE (write, <src-parent>)
+  - KIND_PDXFS_FILE (write, <dst-parent>)
+  - KIND_PDXFS_TXN (invoke, mint)
+
+# Declared output schemas — the semantic-pipe schema records mv emits
+# on stdout. M1 emits none (a successful same-dir rename is silent
+# unless -v is given, in which case a plain-text `mv <src> <dst>`
+# line goes to stdout via the tty). M3 introduces MoveRecord[] via
+# libpdx-semantic-pipe with was_rename / was_cross_device flags.
+declares_output_schemas: (none)

@@ -1,0 +1,242 @@
+// src/mv.pdx -- mv.M1-001 (paideia-os/mv#1)
+//
+// Mv module: top-level scaffold + constants + stats.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M1 substrate for the mv binary. Owns:
+//
+//   * KIND ordinal mirrors (MV_KIND_*) so mv modules do not need to
+//     link paideia-os's kernel .o graph to name the KINDs mv handles.
+//     Redeclared here for the same reason libpdx-elevate mirrors ELV_*
+//     and shell mirrors SH_* -- the M4 smoke matrix catches any drift
+//     between the mirrored values here and the authoritative kernel
+//     values.
+//
+//   * mv's error band (MV_* 0xFFFFEBxx). Disjoint from the libpdx-cap
+//     band (0xFFFFFFxx), the libpdx-elevate band (0xFFFFEAxx /
+//     0xFFFFE5Exx), the shell band (0xFFFFECxx), and the kernel errno
+//     band (-EFAULT = 0xFFFFFFFFFFFFFFF2 ...). The high two bytes of
+//     the return tell a downstream consumer which layer refused.
+//
+//   * An eight-slot _mv_stats counter table with bounded increment
+//     + bounded read (mv_note, mv_stat). Same shape as _shell_stats
+//     in shell/src/shell.pdx and ElevateBroker._elevate_broker_stats
+//     (paideia-os src/kernel/core/ipc/elevate_broker.pdx:70). Cache-
+//     line aligned so a future SMP variant of the counter path does
+//     not straddle a line.
+//
+//   * mv_reset() -- clears the counter table. Startup + teardown only.
+//
+// =============================================================================
+// WHAT M1 IS DELIBERATELY NOT
+// =============================================================================
+//
+// M1 does NOT ship the _start entry frame -- the loader convention that
+// binds argv/envp/InitCap to a userspace binary lands with the R14b
+// paideia-os bootstrap; the mv repo's _start lands at M2 alongside the
+// live TXN dispatch. M1 ships the three modules the run loop calls
+// (Mv, MvArgv, Rename), so a later _start is a wiring job, not a
+// design job.
+//
+// M1 does NOT allocate. Every buffer is caller-owned. Every counter
+// lives in .bss. This mirrors libpdx-cap M1 and shell M1 discipline --
+// mv's M1 has no reason to differ.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Mv`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (MV_ST_MAX = 8 fits
+//     easily; the KIND ordinals and error codes are `mov rax, imm32`
+//     emissions, not compares).
+//   - r11 is scratch (paideia-as conformance) and appears in every
+//     `lea r11, [rip + sym]` .bss reach.
+//   - No byte reads in this module; the `xor rax, rax; mov_b rax, [ptr]`
+//     pattern shows up in MvArgv (flag-name compare).
+//   - mv_reset and mv_note / mv_stat are leaf functions -- no push/pop
+//     parity to preserve.
+
+module Mv = structure {
+
+  // ==========================================================================
+  // KIND ordinal mirrors
+  //
+  // Mirror the authoritative values in paideia-os:
+  //   MV_KIND_IPC_ENDPOINT  src/kernel/core/cap/kind.pdx:72
+  //   MV_KIND_USER          src/kernel/core/cap/kind_user.pdx:122
+  //   MV_KIND_PDXFS_FILE    src/kernel/core/cap/kind_pdxfs_file.pdx:82
+  //   MV_KIND_PDXFS_TXN     src/kernel/core/cap/kind_pdxfs_txn.pdx:71
+  // ==========================================================================
+  pub let MV_KIND_IPC_ENDPOINT : u64 = 5
+  pub let MV_KIND_USER         : u64 = 0x190
+  pub let MV_KIND_PDXFS_FILE   : u64 = 0x195
+  pub let MV_KIND_PDXFS_TXN    : u64 = 0x196
+
+  // ==========================================================================
+  // Rights ordinals mv narrows on (mirrors of paideia-os kind_pdxfs_*)
+  //
+  // R_PDXFS_FILE_WRITE  0x002 -- mv needs write on src-parent + dst-parent
+  // R_PDXFS_TXN_INVOKE  0x008 -- mv needs invoke for commit/abort/query
+  // R_PDXFS_TXN_MINT    0x200 -- mv needs mint to open a fresh TXN
+  // ==========================================================================
+  pub let MV_R_PDXFS_FILE_WRITE : u64 = 0x002
+  pub let MV_R_PDXFS_TXN_INVOKE : u64 = 0x008
+  pub let MV_R_PDXFS_TXN_MINT   : u64 = 0x200
+
+  // ==========================================================================
+  // PdxFS txn mode mv opens (mirror of kind_pdxfs_txn.pdx:88)
+  //
+  // A mv is always MODIFY -- neither pure CREATE (no new inode is
+  // minted) nor pure DELETE (no inode is retired; only a dirent is
+  // moved). MODIFY is the shape the kernel uses when the WAL group's
+  // net effect is a dirent rewrite.
+  // ==========================================================================
+  pub let MV_PXT_MODE_MODIFY : u64 = 2
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEBxx (mv layer)
+  //
+  // High two bytes = 0xFFFFEB identify the mv layer to a downstream
+  // consumer. Full table in design/architecture.md §5.
+  // ==========================================================================
+
+  // Generic success -- unused at M1; reserved so consumers can spell
+  // `MV_OK` at their call sites now and get real semantics at M2.
+  pub let MV_OK                 : u64 = 0xFFFFEB00
+
+  // MvArgv stubs and errors (0xFFFFEB1x)
+  pub let MV_ARG_STUB           : u64 = 0xFFFFEB10   // reserved; unused at M1
+  pub let MV_ARG_BAD_ARGC       : u64 = 0xFFFFEB11   // argc == 0
+  pub let MV_ARG_BAD_ARGV       : u64 = 0xFFFFEB12   // argv == 0
+  pub let MV_ARG_TOO_FEW_POS    : u64 = 0xFFFFEB13   // positional count != 2
+  pub let MV_ARG_UNKNOWN_FLAG   : u64 = 0xFFFFEB14   // flag not in {v,i,dry-run}
+  pub let MV_ARG_PARSE_ERR      : u64 = 0xFFFFEB15   // libpdx-argv reported ERR_*
+
+  // Rename stubs and errors (0xFFFFEB2x)
+  pub let MV_RN_STUB            : u64 = 0xFFFFEB20   // M1: validated, no live TXN
+  pub let MV_RN_BAD_SRC         : u64 = 0xFFFFEB21   // src == 0
+  pub let MV_RN_BAD_DST         : u64 = 0xFFFFEB22   // dst == 0
+  pub let MV_RN_TXN_OPEN_FAIL   : u64 = 0xFFFFEB23   // M2+: sys_pdxfs_txn_open refused
+  pub let MV_RN_UNLINK_FAIL     : u64 = 0xFFFFEB24   // M2+: sys_pdxfs_unlink refused
+  pub let MV_RN_LINK_FAIL       : u64 = 0xFFFFEB25   // M2+: sys_pdxfs_link refused
+  pub let MV_RN_COMMIT_FAIL     : u64 = 0xFFFFEB26   // M2+: sys_pdxfs_txn_commit refused
+
+  // ==========================================================================
+  // Session-level stats -- eight u64 slots, cache-line aligned.
+  //
+  // Slot map (M1):
+  //   0 MV_ST_INVOCATIONS  mv_argv_parse / rename_same_dir entries
+  //   1 MV_ST_RENAMES      successful same-dir renames (M2+)
+  //   2 MV_ST_TXN_OPENS    sys_pdxfs_txn_open calls (M2+); would-open at M1
+  //   3 MV_ST_TXN_COMMITS  sys_pdxfs_txn_commit successes (M2+)
+  //   4 MV_ST_TXN_ABORTS   sys_pdxfs_txn_commit failures (M2+)
+  //   5 MV_ST_ERRORS       any error / reject path from any mv module
+  //   6..7 reserved         for M2 (cross-dir, cross-device)
+  //
+  // Cache-line alignment matches _shell_stats / _elevate_broker_stats
+  // -- keeps a future SMP counter path a mechanical widening rather
+  // than a re-layout.
+  // ==========================================================================
+  pub let mut _mv_stats : [u64; 8] = uninit @align(64)
+
+  pub let MV_ST_INVOCATIONS : u64 = 0
+  pub let MV_ST_RENAMES     : u64 = 1
+  pub let MV_ST_TXN_OPENS   : u64 = 2
+  pub let MV_ST_TXN_COMMITS : u64 = 3
+  pub let MV_ST_TXN_ABORTS  : u64 = 4
+  pub let MV_ST_ERRORS      : u64 = 5
+  pub let MV_ST_MAX         : u64 = 8
+
+  // ==========================================================================
+  // mv_reset() -> ()
+  //
+  // Clear the eight-word _mv_stats counter table. Called by _start
+  // (M2+) before the run and by tests before each fixture. A live
+  // counter reset would race any concurrent mv_note, so this is
+  // startup + teardown only -- same discipline as shell_reset,
+  // elevate_broker_stats_reset, and elevate_client_stats_reset.
+  //
+  // Register plan (leaf):
+  //   r10 = base pointer (loaded once via lea)
+  //   rcx = loop index (0..8)
+  //   rax = zero constant
+  // ==========================================================================
+  pub let mv_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M1-001 (#1): clear the eight-word session stats table. Startup + teardown only; a live counter reset would race any concurrent mv_note (same discipline as shell_reset shell/src/shell.pdx, elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70). Loop: r10 base, rcx index 0..8, rax = 0. `cmp rcx, 8` uses imm <= 0x7FFFFFFF (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed mv_rs_.",
+      block: {
+        lea r10, [rip + _mv_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      mv_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  mv_rs_loop;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_note(which) -> ()
+  //
+  // Bounded increment of _mv_stats[which]. `which >= MV_ST_MAX` is a
+  // no-op (not an error) so a caller passing a slot from a newer
+  // library snapshot against an older binary snapshot cannot corrupt
+  // live counters. Same shape as shell_note and elevate_client_note.
+  //
+  // Register plan (leaf):
+  //   rdi = which (input; preserved through jae)
+  //   r10 = base pointer
+  //   rax = counter load / +1 accumulator
+  // ==========================================================================
+  pub let mv_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M1-001 (#1): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as shell_note (shell/src/shell.pdx) and elevate_client_note (libpdx-elevate/src/elevate_client.pdx). `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed mv_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae mv_nt_out;
+        lea r10, [rip + _mv_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      mv_nt_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_stat(which) -> u64
+  //
+  // Bounded read of _mv_stats[which]. `which >= MV_ST_MAX` returns 0
+  // (not an error sentinel -- see mv_note rationale). Same shape as
+  // shell_stat and elevate_client_stat.
+  //
+  // Register plan (leaf):
+  //   rdi = which
+  //   r10 = base pointer
+  //   rax = return value
+  // ==========================================================================
+  pub let mv_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M1-001 (#1): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as shell_stat (shell/src/shell.pdx) and elevate_client_stat (libpdx-elevate/src/elevate_client.pdx). `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed mv_st_.",
+      block: {
+        cmp rdi, 8;
+        jae mv_st_zero;
+        lea r10, [rip + _mv_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      mv_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+}
