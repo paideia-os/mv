@@ -1,7 +1,7 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — in progress
+**Current milestone:** M2 (core implementation) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
@@ -47,6 +47,28 @@ breakdown.
   move_dispatch's success arm as a best-effort emission (the
   operation is already committed; a fd-2 write refusal does not
   invalidate mv's return code).
+- `src/inode.pdx` (issue #7): Inode module —
+  `mv_inode_preserve(src_inode, dst_parent_inode)` queries owner
+  keys via pdxfs_inode_owner, dispatches: same-user -> bump
+  MV_ST_INODE_PRESERVED; cross-user -> set mv_move_was_cross_user,
+  try pdxfs_inode_rebind_owner under invoker's key, bump either
+  MV_ST_INODE_REKEYED (rebind succeeded) or MV_ST_CROSS_USER
+  (graceful degrade -- inode keeps old owner). Returns 0 for every
+  outcome (metadata refinement, not required step).
+- `src/pdxfs.pdx` (issue #7): three trampolines added --
+  pdxfs_inode_owner (SYS 520), pdxfs_inode_rebind_owner (SYS 521),
+  sys_user_self (SYS 528). All M2 stubs; return 1 (user_key) or 0
+  (rebind OK).
+- `src/verbose.pdx` (issue #7): extended with MV_VERBOSE_XUSER_MSG
+  ("mv: crossed user (inode kept old owner)\n") emission gated on
+  Move::mv_move_was_cross_user. The two advisories are independent
+  -- an operation can be cross-device + cross-user simultaneously
+  and both fire.
+- `src/move.pdx` (issue #7): move_dispatch calls mv_inode_preserve
+  after successful pdxfs_link (or cross-dev unlink) but BEFORE
+  pdxfs_txn_commit -- so a preservation-side abort could unwind
+  the whole TXN (currently mv_inode_preserve never returns non-
+  zero; the ordering is future-proofing).
 
 ## M1 — design + skeleton (complete)
 
@@ -121,7 +143,7 @@ breakdown.
 | M2-001 (#4)     | cross-dir same-device move (link-unlink atomic in TXN)        | LANDED |
 | M2-002 (#5)     | cross-device move via cp+rm internal fallback                 | LANDED |
 | M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | LANDED |
-| M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | OPEN   |
+| M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

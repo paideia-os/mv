@@ -78,6 +78,15 @@ module Verbose = structure {
     "mv: crossed device (cp+rm fallback, not O(1))\n"
   pub let MV_VERBOSE_XDEV_MSG_LEN : u64 = 46
 
+  // M2-004: cross-user advisory. Emitted when Move::mv_move_was_cross_user
+  // is set (Inode::mv_inode_preserve took either the re-key or the
+  // graceful-degrade branch). Independent of the xdev advisory --
+  // a move can be same-device + cross-user OR cross-device +
+  // same-user OR both simultaneously.
+  pub let MV_VERBOSE_XUSER_MSG : [u8; 40] =
+    "mv: crossed user (inode kept old owner)\n"
+  pub let MV_VERBOSE_XUSER_MSG_LEN : u64 = 40
+
   // ==========================================================================
   // mv_verbose_diag() -> u64
   //
@@ -94,26 +103,39 @@ module Verbose = structure {
   pub let mv_verbose_diag : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "mv.M2-003 (#6): mv_verbose_diag. Gate 1: MvArgv::mv_argv_verbose == 1 (via `lea r11, [rip+mv_argv_verbose]; mov rax, [r11]; cmp rax, 0; je out`). Gate 2: Move::mv_move_was_cross_device == 1 (same idiom). If both pass, call pdxfs_write(fd=2, MV_VERBOSE_XDEV_MSG, MV_VERBOSE_XDEV_MSG_LEN) via `mov rdi, 2; lea rsi, [rip+MV_VERBOSE_XDEV_MSG]; mov rdx, 46; call pdxfs_write`. Return 0 unconditionally -- the diagnostic is best-effort per D3 audit-first: the mv operation itself succeeded (Move set the flag AFTER committing), so a fd-2 write refusal does not invalidate that. Return-value ignored. Stack alignment: entry rsp % 16 == 8; `sub rsp, 8` on entry brings it to 0 for the nested pdxfs_write; `add rsp, 8` before ret. Same idiom as libpdx-elevate's small single-call helpers. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0 and 2 both fit). r11 scratch for .bss reaches. Labels prefixed mv_vd_.",
+      justification: "mv.M2-003 (#6) + mv.M2-004 (#7): mv_verbose_diag. Gate 1: MvArgv::mv_argv_verbose == 1 (via `lea r11, [rip+mv_argv_verbose]; mov rax, [r11]; cmp rax, 0; je out`); short-circuits if verbose is off. If verbose IS on, checks Move::mv_move_was_cross_device INDEPENDENTLY of Move::mv_move_was_cross_user -- both flags can fire in one operation (a same-device cross-user move OR a cross-device same-user move OR both simultaneously). Each `if flag == 1` gate calls pdxfs_write(fd=2, msg, len) for its corresponding advisory. Return 0 unconditionally -- the diagnostic is best-effort per D3 audit-first: the mv operation itself succeeded (both flags set BEFORE the caller committed but the caller committed successfully anyway), so a fd-2 write refusal does not invalidate that. Return-value ignored. Stack alignment: entry rsp % 16 == 8; `sub rsp, 8` on entry brings it to 0 for the nested pdxfs_write calls; `add rsp, 8` before ret. Same idiom as libpdx-elevate's small single-call helpers. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 2, 40, 46 all fit). r11 scratch for .bss reaches. Labels prefixed mv_vd_.",
       block: {
         sub rsp, 8;                          // align rsp % 16 == 0 for pdxfs_write
 
-        // Gate 1: --verbose flag.
+        // Gate 1: --verbose flag. If off, no diagnostics emit.
         lea r11, [rip + mv_argv_verbose];
         mov rax, [r11];
         cmp rax, 0;
         je  mv_vd_out;
 
-        // Gate 2: was_cross_device flag.
+        // --- Advisory A: was_cross_device ---
         lea r11, [rip + mv_move_was_cross_device];
         mov rax, [r11];
         cmp rax, 0;
-        je  mv_vd_out;
+        je  mv_vd_check_xuser;
 
         // Emit "mv: crossed device (cp+rm fallback, not O(1))\n" on fd 2.
         mov rdi, 2;                          // stderr
         lea rsi, [rip + MV_VERBOSE_XDEV_MSG];
         mov rdx, 46;                         // MV_VERBOSE_XDEV_MSG_LEN
+        call pdxfs_write;
+
+      mv_vd_check_xuser:
+        // --- Advisory B: was_cross_user ---
+        lea r11, [rip + mv_move_was_cross_user];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mv_vd_out;
+
+        // Emit "mv: crossed user (inode kept old owner)\n" on fd 2.
+        mov rdi, 2;                          // stderr
+        lea rsi, [rip + MV_VERBOSE_XUSER_MSG];
+        mov rdx, 40;                         // MV_VERBOSE_XUSER_MSG_LEN
         call pdxfs_write;
 
       mv_vd_out:

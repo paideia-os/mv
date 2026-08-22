@@ -1,0 +1,170 @@
+// src/inode.pdx -- mv.M2-004 (paideia-os/mv#7)
+//
+// Inode module: signed-inode preservation for mv.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M2-004 is the plan doc §5.7 M2 line's fourth landing:
+//
+//   "signed-inode preservation (same as cp §5.6 -- same-user preserves,
+//    cross-user degrades gracefully)"
+//
+// PdxFS v1 signs every KIND_PDXFS_FILE inode's metadata tail under
+// its owner's user secret key (ML-DSA-65 signature per the R48
+// signed-cap discipline; see paideia-os design/user/model.md §2).
+// A rename that keeps the inode under the same owner preserves the
+// signature. A rename that moves the inode across a user boundary
+// leaves the caller with two options:
+//
+//   (1) Re-sign under the invoker's user_sk (if it's unlocked in
+//       the caller's cap_table). This transfers ownership; the
+//       old owner's signature becomes stale but the inode gets a
+//       fresh signature the destination-user's tooling recognises.
+//   (2) Graceful degrade: keep the inode's old owner tail. The
+//       destination-user's tools that rely on signature-verify
+//       against dst-user-key will refuse to open the inode. mv
+//       emits a --verbose diagnostic ("mv: crossed user (inode
+//       kept old owner)") to flag the degrade so a downstream
+//       operator can either accept the state or chase it.
+//
+// Both cases keep the mv operation successful -- the plan calls for
+// "graceful degrade", not "hard fail". The choice between (1) and
+// (2) is made per-inode based on whether pdxfs_inode_rebind_owner
+// succeeds; if the invoker lacks a signing cap the syscall returns
+// EPERM and mv falls into (2).
+//
+// =============================================================================
+// SEQUENCE
+// =============================================================================
+//
+// mv_inode_preserve(src_inode, dst_parent_inode) -> u64
+//
+//   1. Get src inode owner:  pdxfs_inode_owner(src_inode).
+//   2. Get dst parent owner: pdxfs_inode_owner(dst_parent).
+//   3. If same:  bump MV_ST_INODE_PRESERVED, return 0.
+//   4. Else (cross-user):
+//      4a. Set mv_move_was_cross_user = 1 (feeds the M2-003 verbose
+//          diagnostic; extended by this milestone).
+//      4b. Get invoker key: sys_user_self().
+//      4c. Try pdxfs_inode_rebind_owner(src_inode, invoker_key).
+//      4d. On success: bump MV_ST_INODE_REKEYED, return 0.
+//      4e. On failure: bump MV_ST_CROSS_USER, return 0 (graceful
+//          degrade -- the inode keeps its old owner tail; the
+//          verbose diagnostic flags the degrade).
+//
+// The function returns 0 in every case. Signed-inode preservation is
+// best-effort; a failure does not invalidate the mv operation itself.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Inode`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0 and 1 fit).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - Byte reads not used (all values are u64 opaque handles).
+//   - SysV push/pop parity: mv_inode_preserve saves rbx + r12 across
+//     the nested Pdxfs::* calls (src_owner + dst_owner cached across
+//     the pdxfs_inode_owner returns). Prologue is 2 pushes + `sub
+//     rsp, 8` for even-alignment; matching epilogue.
+
+module Inode = structure {
+
+  // ==========================================================================
+  // mv_inode_preserve(src_inode, dst_parent_inode) -> u64
+  //
+  // RDI (input): src_inode        -- inode handle whose owner tail
+  //                                  needs preserving.
+  // RSI (input): dst_parent_inode -- destination parent inode
+  //                                  (its owner is the effective
+  //                                  target-user of the move).
+  // RAX (output): 0 always -- signed-inode preservation is best-effort.
+  //
+  // Register plan:
+  //   rbx = src_inode          (preserved across every call)
+  //   r12 = dst_parent_inode   (preserved -- must survive the first
+  //                             pdxfs_inode_owner call because rsi is
+  //                             caller-save and would be clobbered)
+  //   r13 = src_owner_key      (stashed after first pdxfs_inode_owner
+  //                             for the cmp with the second call's
+  //                             return); reused as invoker_key on the
+  //                             cross-user branch
+  //   rax = call return / dst_owner_key (used immediately for the cmp)
+  //   rdi = SysV arg
+  //   r11 = LEA scratch
+  //
+  // Prologue: 3 callee-save pushes (rbx, r12, r13) = 24 bytes.
+  // Entry rsp % 16 == 8; 3 pushes flip the parity to 0 (odd-count
+  // idiom, same as cp copy_single_file / mv move_dispatch). No stack-
+  // pad sub needed. Matched 3-pop epilogue.
+  // ==========================================================================
+  pub let mv_inode_preserve : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (src_inode: u64) (dst_parent_inode: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mv.M2-004 (#7): mv_inode_preserve -- signed-inode preservation with graceful cross-user degrade. Stashes src_inode + dst_parent_inode into callee-save rbx + r12 first (dst_parent came in via rsi which is caller-save and will be clobbered by the first pdxfs_inode_owner call, so it MUST be stashed before). Two pdxfs_inode_owner queries: src_owner into r13, dst_owner into rax (used immediately for the cmp). `cmp r13, rax; je preserved_path` identifies same-user (bump MV_ST_INODE_PRESERVED, return 0). Cross-user path sets mv_move_was_cross_user (M2-003 verbose gate extension), calls sys_user_self to fetch invoker key (stashed to r13), calls pdxfs_inode_rebind_owner(src_inode, invoker_key), and branches on the return: 0 -> bump MV_ST_INODE_REKEYED; non-zero -> bump MV_ST_CROSS_USER (graceful degrade). Return 0 unconditionally -- the mv operation itself is already committed by the caller; signed-inode preservation is a metadata refinement, not a required step. Prologue 3 callee-save pushes (rbx=src_inode, r12=dst_parent_inode, r13=src_owner/invoker_key) = 24 bytes; entry rsp % 16 == 8, 3 pushes flip parity to 0 (odd-count idiom); no stack-pad sub needed; matched 3-pop epilogue. All `cmp reg, imm` use imm <= 0x7FFFFFFF (only 0 appears). @{cap} because pdxfs_inode_rebind_owner consumes KIND_USER(sign) from the caller's cap_table. Labels prefixed mv_ip_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // rbx = src_inode
+        mov r12, rsi;                        // r12 = dst_parent_inode (stash before clobber)
+
+        // ---- Step 1: get src owner ------------------------------------------
+        mov rdi, rbx;                        // src_inode
+        call pdxfs_inode_owner;
+        mov r13, rax;                        // r13 = src_owner
+
+        // ---- Step 2: get dst parent owner -----------------------------------
+        mov rdi, r12;                        // dst_parent_inode (from stash)
+        call pdxfs_inode_owner;
+        // rax = dst_owner (used immediately in cmp; no need to stash)
+
+        // ---- Step 3: same-user? ---------------------------------------------
+        cmp r13, rax;
+        je  mv_ip_preserved;
+
+        // ---- Cross-user path ------------------------------------------------
+        // 4a: set was_cross_user flag for the verbose diagnostic.
+        mov rax, 1;
+        lea r11, [rip + mv_move_was_cross_user];
+        mov [r11], rax;
+
+        // 4b: fetch invoker key (reuse r13 for the new value).
+        call sys_user_self;
+        mov r13, rax;                        // r13 = invoker_key
+
+        // 4c: try rebind.
+        mov rdi, rbx;                        // src_inode
+        mov rsi, r13;                        // invoker_key
+        call pdxfs_inode_rebind_owner;
+        cmp rax, 0;
+        jne mv_ip_rekey_fail;
+
+        // 4d: rebind succeeded.
+        mov rdi, 10;                         // MV_ST_INODE_REKEYED
+        call mv_note;
+        jmp mv_ip_done;
+
+      mv_ip_rekey_fail:
+        // 4e: graceful degrade.
+        mov rdi, 8;                          // MV_ST_CROSS_USER
+        call mv_note;
+        jmp mv_ip_done;
+
+      mv_ip_preserved:
+        mov rdi, 9;                          // MV_ST_INODE_PRESERVED
+        call mv_note;
+
+      mv_ip_done:
+        xor rax, rax;                        // return 0 always
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -126,6 +126,15 @@ module Move = structure {
   // at M3 (MoveRecord.was_cross_device). Cleared in move_reset.
   pub let mut mv_move_was_cross_device : u64 = uninit @align(8)
 
+  // -- M2-004 was_cross_user flag --------------------------------------------
+  //
+  // Set to 1 by Inode::mv_inode_preserve when the src inode's owner
+  // differs from the dst parent's owner. The verbose diagnostic
+  // (M2-003 extended) reads this to decide whether to emit the
+  // "crossed user" advisory. Also feeds the MoveRecord.was_cross_user
+  // semantic-pipe field at M3.
+  pub let mut mv_move_was_cross_user : u64 = uninit @align(8)
+
   // -- Return-code stash slot -----------------------------------------------
   //
   // move_dispatch uses this to preserve the specific MV_MV_XDEV_*
@@ -158,6 +167,7 @@ module Move = structure {
         lea r11, [rip + mv_move_xdev_fd_dst];       mov [r11], rax;
         lea r11, [rip + mv_move_xdev_bytes];        mov [r11], rax;
         lea r11, [rip + mv_move_was_cross_device];  mov [r11], rax;
+        lea r11, [rip + mv_move_was_cross_user];    mov [r11], rax;
         ret
       }
     }
@@ -534,6 +544,16 @@ module Move = structure {
         call mv_note;
 
       mv_md_link_ok:
+        // ---- Step 6c (M2-004): signed-inode preservation --------------------
+        // Best-effort -- mv_inode_preserve returns 0 always. On same-
+        // user the inode's owner tail is preserved; on cross-user it
+        // is re-signed under the invoker (or the flag is set for the
+        // verbose diagnostic if the rebind is refused).
+        lea r11, [rip + mv_move_src_inode];
+        mov rdi, [r11];                      // src_inode
+        mov rsi, r14;                        // dst_parent (in r14)
+        call mv_inode_preserve;
+
         // ---- Step 7: commit TXN ---------------------------------------------
         mov rdi, r15;                        // txn
         call pdxfs_txn_commit;

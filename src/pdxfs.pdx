@@ -73,6 +73,9 @@ module Pdxfs = structure {
   pub let SYS_PDXFS_RESOLVE_PARENT : u64 = 517
   pub let SYS_PDXFS_INODE_OF       : u64 = 518
   pub let SYS_PDXFS_DEVICE_OF      : u64 = 519
+  pub let SYS_PDXFS_INODE_OWNER    : u64 = 520   // M2-004: signed-inode owner query
+  pub let SYS_PDXFS_INODE_REBIND   : u64 = 521   // M2-004: re-sign inode under new owner
+  pub let SYS_USER_SELF            : u64 = 528   // M2-004: R48 KIND_USER self-query
 
   // ==========================================================================
   // PdxFS TXN mode ordinals (mirror kind_pdxfs_txn.pdx L88).
@@ -342,6 +345,72 @@ module Pdxfs = structure {
       justification: "mv.M2-001 (#4): pdxfs_device_of trampoline. M2 STUB returns 1 (single-device world) so a same-device check `cmp src_dev, dst_dev; je same_device` always takes the same-device branch at M2. R42 body: `mov rax, 519; syscall; ret`. Arity 1. Leaf; sysreg for future syscall clobber.",
       block: {
         mov rax, 1;                            // STUB: single device
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_inode_owner(inode_handle) -> user_key_or_errno
+  //
+  // Return the KIND_USER key that signed the inode's owner tail
+  // (R48 signed-cap discipline; every KIND_PDXFS_FILE inode carries
+  // an ML-DSA-65 signature over its metadata under the owner's user
+  // secret). mv M2-004 uses this to detect same-user vs cross-user
+  // moves. M2 STUB returns 1 (all inodes owned by user 1) so the
+  // same-user branch always fires -- exercising the preservation
+  // path in stub testing.
+  // ==========================================================================
+  pub let pdxfs_inode_owner : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (inode_handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-004 (#7): pdxfs_inode_owner trampoline. M2 STUB returns 1 (single-user world) so the same-user check `cmp src_owner, dst_owner; je same_user` always takes the same-user branch, exercising the MV_ST_INODE_PRESERVED counter path in stub tests. R42 body: `mov rax, 520; syscall; ret`. Arity 1. Leaf; sysreg for future syscall clobber. When R48 signed-inode substrate lands, the M4 fixture matrix will exercise the cross-user branch via a mocked owner query.",
+      block: {
+        mov rax, 1;                            // STUB: user 1 owns everything
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_inode_rebind_owner(inode_handle, new_user_key) -> 0_or_errno
+  //
+  // Re-sign the inode's owner tail under the supplied user key
+  // (M2-004 cross-user path). The R48 substrate requires the caller
+  // to hold KIND_USER(sign, new_user_key) -- if the invoker's user
+  // secret is not available the syscall returns EPERM and mv M2-004
+  // gracefully degrades (the inode keeps its old owner; the verbose
+  // diagnostic records the degrade).
+  //
+  // M2 STUB returns 0 (success) so the "rebind worked" branch fires
+  // in stub tests when cross-user IS injected. Since M2 stub owner
+  // query always returns 1, cross-user branch does not fire in the
+  // default stub configuration.
+  // ==========================================================================
+  pub let pdxfs_inode_rebind_owner : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (inode_handle: u64) (new_user_key: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mv.M2-004 (#7): pdxfs_inode_rebind_owner trampoline. M2 STUB returns 0 (success) so the MV_ST_INODE_REKEYED counter path is exercised if cross-user is injected. R42 body: `mov rax, 521; syscall; ret`. Arity 2, no r10 shuffle. @{cap} because the R48 substrate consumes a KIND_USER(sign, new_user_key) cap from the caller's cap_table; that cap gate is documented at paideia-os design/user/model.md. Leaf; sysreg for future syscall clobber.",
+      block: {
+        xor rax, rax;                          // STUB: PDXFS_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_user_self() -> user_key
+  //
+  // Return the invoker's KIND_USER key (R48 substrate self-query).
+  // Used by mv M2-004 as the new_user_key argument to
+  // pdxfs_inode_rebind_owner on the cross-user path.
+  //
+  // M2 STUB returns 1 (matching the pdxfs_inode_owner stub so the
+  // same-user branch always fires in the default stub config).
+  // ==========================================================================
+  pub let sys_user_self : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-004 (#7): sys_user_self trampoline. M2 STUB returns 1 (matching pdxfs_inode_owner's stub so the same-user branch fires). R48 body: `mov rax, 528; syscall; ret`. Arity 0. Leaf; sysreg for future syscall clobber. R48.M1 KIND_USER substrate at paideia-os src/kernel/core/cap/kind_user.pdx documents the self-query semantics.",
+      block: {
+        mov rax, 1;                            // STUB: invoker is user 1
         ret
       }
     }

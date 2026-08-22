@@ -151,6 +151,13 @@ module Mv = structure {
   pub let MV_MV_XDEV_SHORT_WRITE   : u64 = 0xFFFFEB3C   // sys_write short (partial state)
   pub let MV_MV_XDEV_UNLINK_FAIL   : u64 = 0xFFFFEB3D   // pdxfs_unlink refused inside TXN
 
+  // Inode signed-preservation (M2-004) return-code band 0xFFFFEB4x.
+  // Reserved: mv_inode_preserve returns 0 for every outcome (same-user
+  // preserve, cross-user re-key success, cross-user graceful degrade).
+  // The band exists so a future hard-fail variant (e.g. R48 mandatory-
+  // sign policy) has a well-known slot.
+  pub let MV_MV_INODE_STUB         : u64 = 0xFFFFEB40   // reserved
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
