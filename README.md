@@ -30,6 +30,7 @@ pkg install --from-source mv
 - `design/architecture.md` — internal module shape.
 - `CHANGELOG.md` — release history.
 - `RELEASE.md` — signing runbook.
+- `MIRROR-PUSH.md` — `pkgs.paideia-os` mirror push runbook.
 
 ## License
 

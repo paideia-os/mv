@@ -1,12 +1,13 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M5 (signed 1.0 release) — M5-001 landed
+**Current milestone:** M5 (signed 1.0 release) — complete
+(repo tag; `pkgs.paideia-os` mirror pending T-INFRA-001 + T-INFRA-002)
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
 
-## M5 — signed 1.0 release (M5-001 landed; M5-002 pending)
+## M5 — signed 1.0 release (complete)
 
 - `manifest.pdxsig` (issue #15): dual-signed package manifest at
   repo root per `design/tooling/plan.md` §6.3 + §9.3. Format is
@@ -64,6 +65,21 @@ breakdown.
   reserved-for-future entries (1.0.1 for R42 substrate
   landing; 1.0.0-signed for the identical tree with real
   signatures).
+- `MIRROR-PUSH.md` (issue #16): mirror push runbook. Names the
+  three legs of the pkgs.paideia-os mirror push: Leg A
+  (signing-bot re-sign, T-INFRA-002-gated), Leg B (pkgs.paideia-
+  os/main/mv/1.0.0/ tuple push, T-INFRA-001-gated), Leg C
+  (announcement + STATUS bump). The `v1.0.0` git tag on
+  `github.com/paideia-os/mv` IS the leg landed by M5-002 —
+  the interim distribution point that `pkg install --from-
+  source mv` reads today until Legs A + B stand up. Documents
+  four verification recipes (release-engineer side, pkgs.
+  paideia-os side, from-source user side, dual-sign user
+  side).
+- `v1.0.0` git tag on `github.com/paideia-os/mv` (issue #16):
+  annotated tag at the M5-002 commit — interim distribution
+  point per Leg C rationale above. Pushed alongside the M5-002
+  commit; visible via `git tag -l v1.0.0` at HEAD.
 
 ## M4 — tests + smoke (complete)
 
@@ -390,7 +406,7 @@ breakdown.
 | M4-002 (#13)    | undo replay correctness across all four cases                 | LANDED |
 | M4-003 (#14)    | QEMU smoke: mv a b; undo mv a b; ls verifies                  | LANDED |
 | M5-001 (#15)    | dual-signed release + .pdxdoc                                 | LANDED |
-| M5-002 (#16)    | mirror push                                                   | PENDING |
+| M5-002 (#16)    | mirror push (repo tag; pkgs.paideia-os pending T-INFRA)       | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-22)
 
