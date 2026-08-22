@@ -40,6 +40,21 @@ breakdown.
   mv_move_return_code stash slot (nested calls clobber rax). This
   is the D3 audit-first gate: a mv that cannot log its own
   operation is refused.
+- `src/undo.pdx` (issue #10): Undo module — 32-byte UndoRecord
+  layout (magic + replay_op + replay_src_ptr + replay_dst_ptr).
+  `mv_undo_reset` / `mv_undo_populate(src, dst)` populates with
+  SWAPPED paths (replay_src=dst, replay_dst=src) so `pdx-undo`
+  replaying with `mv <replay_src> <replay_dst>` invokes
+  `mv <original_dst> <original_src>` and reverses the TXN.
+  `mv_undo_write(txn_handle)` threads the record into the WAL
+  group via pdxfs_txn_write_undo (sysno 522; M3 STUB pending
+  R42 substrate landing). Return-code band 0xFFFFEB7x. Adds
+  MV_ST_UNDO_RECORDS (slot 13).
+- `src/move.pdx` (issue #10): Move::move_dispatch calls
+  mv_undo_reset + mv_undo_populate + mv_undo_write AFTER audit
+  write and BEFORE commit. Best-effort: a failed undo write does
+  NOT abort the TXN (I5 uplift; the audit journal still records
+  the operation, so the mv is still accountable).
 
 ## M2 — core implementation (complete)
 
@@ -173,6 +188,8 @@ breakdown.
 | 0xFFFFEB60 | MV_AUD_STUB              | Audit.M3-002: reserved                     |
 | 0xFFFFEB61 | MV_AUD_LOOKUP_FAIL       | Audit.M3-002: sys_svc_lookup neg errno     |
 | 0xFFFFEB62 | MV_AUD_SEND_FAIL         | Audit.M3-002: sys_ipc_send neg errno       |
+| 0xFFFFEB70 | MV_UND_STUB              | Undo.M3-003: reserved                      |
+| 0xFFFFEB71 | MV_UND_WRITE_FAIL        | Undo.M3-003: pdxfs_txn_write_undo neg errno|
 
 ## Milestone rollup
 
@@ -187,6 +204,7 @@ breakdown.
 | M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | LANDED |
 | M3-001 (#8)     | MoveRecord[] schema bind (was_rename, was_cross_device flags) | LANDED |
 | M3-002 (#9)     | MoveRecord via libpdx-audit before commit                     | LANDED |
+| M3-003 (#10)    | PdxFS v1 undo record (replay is mv <dst> <src>)               | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

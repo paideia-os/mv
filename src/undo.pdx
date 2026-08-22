@@ -1,0 +1,275 @@
+// src/undo.pdx -- mv.M3-003 (paideia-os/mv#10)
+//
+// Undo module: PdxFS v1 undo record write (replay is mv <dst> <src>).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M3-003 is the plan doc §5.7 M3 line's third landing:
+//
+//   "Every `mv` writes a PdxFS v1 undo record whose replay is
+//    `mv <dst> <src>`."
+//
+// The PdxFS v1 substrate supports per-TXN undo records: a caller
+// threads a small serialized "replay tuple" into the TXN's WAL
+// group via sys_pdxfs_txn_write_undo (sysno 522, reserved band
+// 512-527 -- see paideia-os design/kernel/pdxfs-v1.md §Undo).
+// The tuple describes the operation that would REVERSE this TXN,
+// so a `pdx-undo` supervisor process replaying the record has
+// exact reconstruction semantics without needing to introspect
+// the TXN's opcodes.
+//
+// For mv the reverse operation is trivially symmetric: `mv <src>
+// <dst>` is reversed by `mv <dst> <src>`. This module builds a
+// 32-byte UndoRecord with the two path pointers SWAPPED (replay_src
+// = original dst; replay_dst = original src) and writes it to the
+// caller's TXN via pdxfs_txn_write_undo.
+//
+// The write is best-effort from the mv operation's point of view:
+// a failed undo write does NOT abort the TXN (compare M3-002 audit
+// write which DOES). Rationale from the plan (I5 uplift): "a mv
+// without an undo record is still a valid mv -- the audit journal
+// still records the operation; the missing undo just means an
+// operator has to reconstruct the reverse by hand instead of via
+// `pdx-undo`". Under D3 audit-first the operation is still
+// accountable; the undo record is a convenience for operators, not
+// a security-relevant record.
+//
+// This module owns:
+//
+//   * The UndoRecord fixed layout (a single 32-byte record;
+//     four u64 fields at fixed offsets: magic + replay_op +
+//     replay_src_ptr + replay_dst_ptr).
+//   * A .bss slot (mv_undo_record) sized to hold the record.
+//   * The pdxfs_txn_write_undo trampoline (sysno 522; M3 STUB
+//     returns 0 pending R42 substrate landing of the undo dispatch).
+//   * mv_undo_reset() to clear the slot.
+//   * mv_undo_populate(src_ptr, dst_ptr) to fill it with the
+//     SWAPPED pointers (the mv semantic: to undo `mv src dst`,
+//     invoke `mv dst src`).
+//   * mv_undo_write(txn_handle) to thread the record into the TXN.
+//
+// =============================================================================
+// RECORD LAYOUT (32 bytes; four u64 fields; @align(8))
+// =============================================================================
+//
+//   Offset  Size  Field
+//        0     8  magic            = MV_UNDO_MAGIC (schema tag)
+//        8     8  replay_op        = MV_UNDO_OP_MV (0x6D76 == "mv")
+//       16     8  replay_src_ptr   (original dst -- the source of the reverse)
+//       24     8  replay_dst_ptr   (original src -- the target of the reverse)
+//
+// pdx-undo interprets the record as: "if the operator replays this
+// TXN, invoke the tool identified by replay_op with (replay_src_ptr,
+// replay_dst_ptr) as positional args". For mv the tool identity is
+// implicit (the TXN was created by mv) -- but the replay_op field
+// exists to keep the record self-describing for a generic undo
+// replayer that walks the WAL group with no per-tool knowledge.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Undo`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears).
+//   - Byte reads not used (record fields are u64).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - mv_undo_reset + mv_undo_populate are LEAF functions (no
+//     nested SysV calls). mv_undo_write has one nested call
+//     (pdxfs_txn_write_undo); prologue `sub rsp, 8` for alignment.
+
+module Undo = structure {
+
+  // ==========================================================================
+  // PdxFS v1 undo syscall number (mirror paideia-os R42 substrate
+  // reserved band at src/kernel/core/syscall/dispatch.pdx).
+  //
+  //   522 sys_pdxfs_txn_write_undo (txn_handle, record_va, record_len)
+  //       Body-edit: `mov rax, 522; syscall; ret`. M3 STUB below.
+  // ==========================================================================
+  pub let SYS_PDXFS_TXN_WRITE_UNDO : u64 = 522
+
+  // ==========================================================================
+  // Record layout constants
+  //
+  // Documentation only -- the write asm below uses literal integer
+  // offsets (matches Schema module discipline).
+  // ==========================================================================
+  pub let MV_UNDO_RECORD_SIZE  : u64 = 32
+
+  pub let URO_MAGIC            : u64 = 0
+  pub let URO_REPLAY_OP        : u64 = 8
+  pub let URO_REPLAY_SRC_PTR   : u64 = 16
+  pub let URO_REPLAY_DST_PTR   : u64 = 24
+
+  // ==========================================================================
+  // UndoRecord magic / schema id
+  //
+  // High 32 bits = 0xFFFFEB70 (mv's Undo-band tag). Low 32 bits =
+  // 0x00000001 (schema version 1). Parallel structure to
+  // Schema::MV_MOVE_RECORD_MAGIC (0xFFFFEB5000000001).
+  // ==========================================================================
+  pub let MV_UNDO_MAGIC        : u64 = 0xFFFFEB7000000001
+
+  // ==========================================================================
+  // replay_op tag: "mv" ASCII bytes packed little-endian
+  //
+  // 0x6D76 = 0x76 ('v') << 8 | 0x6D ('m') -- wait, in a little-
+  // endian u64 store, byte 0 is the low byte. So `mov [addr], 0x6D76`
+  // stores 0x76 at addr+1 and 0x6D at addr+0. A byte-wise reader
+  // sees "mv" (m at low addr, v at low+1). Correct.
+  // ==========================================================================
+  pub let MV_UNDO_OP_MV        : u64 = 0x6D76
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEB7x (Undo layer)
+  //
+  //   0xFFFFEB70 MV_UND_STUB          reserved
+  //   0xFFFFEB71 MV_UND_WRITE_FAIL    pdxfs_txn_write_undo returned neg errno
+  // ==========================================================================
+  pub let MV_UND_STUB        : u64 = 0xFFFFEB70
+  pub let MV_UND_WRITE_FAIL  : u64 = 0xFFFFEB71
+
+  // ==========================================================================
+  // Storage
+  // ==========================================================================
+  pub let mut mv_undo_record : [u8; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // pdxfs_txn_write_undo(txn_handle, record_va, record_len) -> 0_or_errno
+  //
+  // Thread a serialized undo record into the given TXN's WAL group.
+  // The kernel copies record_len bytes from record_va into the WAL
+  // scope; the copy is durable when pdxfs_txn_commit succeeds (an
+  // aborted TXN discards the undo record along with the rest of the
+  // WAL group).
+  //
+  // RDI = txn_handle, RSI = record_va, RDX = record_len.
+  // RAX = 0 on success, negative errno on failure.
+  //
+  // M3 STUB returns 0 (success) pending R42 substrate landing of the
+  // undo dispatch. The R42 body-edit is `mov rax, 522; syscall; ret`
+  // (arity 3, no r10 shuffle).
+  // ==========================================================================
+  pub let pdxfs_txn_write_undo : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_handle: u64) (record_va: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M3-003 (#10): pdxfs_txn_write_undo trampoline. M3 STUB returns 0 (success) pending R42 substrate landing of the undo dispatch. R42 body: `mov rax, 522; syscall; ret`. Arity 3, no r10 shuffle. Sysno 522 sits in the reserved PdxFS v1 band 512-527 (see paideia-os src/kernel/core/syscall/dispatch.pdx L256-263 and the R42 substrate design at design/kernel/pdxfs-v1.md §Undo). The WAL group buffers the copy; pdxfs_txn_commit makes it durable, pdxfs_txn_abort discards it. Leaf; sysreg for future SYSRET clobber.",
+      block: {
+        xor rax, rax;                            // STUB: PDXFS_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_undo_reset() -> ()
+  //
+  // Zero the four u64 slots inside mv_undo_record. Called from
+  // Move::move_dispatch at the top of a fresh invocation (before
+  // mv_undo_populate). Leaf; r11 scratch.
+  // ==========================================================================
+  pub let mv_undo_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M3-003 (#10): zero the four-u64 mv_undo_record buffer so a subsequent mv_undo_populate starts from a known-empty baseline. Four `mov [r11 + off], rax` stores at offsets 0/8/16/24 (literal immediates, matches Schema::mv_schema_reset idiom). r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + mv_undo_record];
+        mov [r11 + 0], rax;
+        mov [r11 + 8], rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_undo_populate(src_ptr, dst_ptr) -> ()
+  //
+  // Fill the UndoRecord slot with the SWAPPED path pointers. To
+  // undo `mv <src> <dst>` the operator replays `mv <dst> <src>`, so:
+  //
+  //   record.replay_src_ptr = dst_ptr   (the reverse's source)
+  //   record.replay_dst_ptr = src_ptr   (the reverse's destination)
+  //
+  // RDI (input): src_ptr -- original source (becomes replay_dst)
+  // RSI (input): dst_ptr -- original destination (becomes replay_src)
+  //
+  // Leaf; no nested SysV calls. r11 scratch. Every field store uses
+  // a literal offset (0/8/16/24). MV_UNDO_MAGIC is > 32-bit so it
+  // uses `mov r64, imm64` encoding.
+  // ==========================================================================
+  pub let mv_undo_populate : (u64, u64) -> () !{mem} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M3-003 (#10): populate the UndoRecord with SWAPPED paths (replay_src=dst, replay_dst=src) so a pdx-undo replayer running `mv <replay_src> <replay_dst>` invokes `mv <original_dst> <original_src>` and reverses this TXN. Four field stores at literal offsets: 0 (magic imm64), 8 (replay_op = 0x6D76 == 'mv'), 16 (replay_src_ptr = rsi), 24 (replay_dst_ptr = rdi). MV_UNDO_MAGIC (0xFFFFEB7000000001) uses `mov r64, imm64` encoding. r11 scratch. Leaf function -- no push/pop parity. Labels prefixed mv_up_.",
+      block: {
+        // ---- Field 0: magic --------------------------------------------------
+        mov rax, 0xFFFFEB7000000001;             // MV_UNDO_MAGIC (imm64)
+        lea r11, [rip + mv_undo_record];
+        mov [r11 + 0], rax;
+
+        // ---- Field 8: replay_op = MV_UNDO_OP_MV -----------------------------
+        mov rax, 0x6D76;                         // 'mv' packed LE
+        mov [r11 + 8], rax;
+
+        // ---- Field 16: replay_src_ptr = rsi (the original dst_ptr) ----------
+        mov [r11 + 16], rsi;
+
+        // ---- Field 24: replay_dst_ptr = rdi (the original src_ptr) ----------
+        mov [r11 + 24], rdi;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_undo_write(txn_handle) -> u64
+  //
+  // Thread the populated UndoRecord into the caller's TXN via
+  // pdxfs_txn_write_undo.
+  //
+  // RDI (input): txn_handle -- KIND_PDXFS_TXN slot from move_dispatch.
+  //
+  // Return:
+  //   0                  on success
+  //   MV_UND_WRITE_FAIL  pdxfs_txn_write_undo returned negative errno
+  //
+  // Bumps MV_ST_UNDO_RECORDS (slot 13) on success; MV_ST_ERRORS on
+  // failure.
+  //
+  // One nested SysV call. Prologue `sub rsp, 8` to align rsp % 16 == 0.
+  // ==========================================================================
+  pub let mv_undo_write : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M3-003 (#10): mv_undo_write -- thread the populated UndoRecord into the caller's TXN via pdxfs_txn_write_undo(txn, record_va, 32). Single nested SysV call; prologue `sub rsp, 8` aligns rsp % 16 == 0 for the call (entry rsp % 16 == 8; sub 8 -> 0; matches libpdx-elevate small-single-call idiom). `cmp rax, 0; jl fail` catches negative errno. On success bumps MV_ST_UNDO_RECORDS (slot 13); on failure bumps MV_ST_ERRORS (slot 5). Best-effort from the outer move_dispatch's view -- a failed undo write does NOT abort the TXN (I5 uplift: a mv without an undo record is still a valid mv; the audit journal at M3-002 still records the operation). Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears). Labels prefixed mv_uw_.",
+      block: {
+        sub rsp, 8;                              // align rsp % 16 == 0
+
+        // rdi already holds txn_handle from the caller.
+        lea rsi, [rip + mv_undo_record];         // record_va
+        mov rdx, 32;                             // record_len (MV_UNDO_RECORD_SIZE)
+        call pdxfs_txn_write_undo;
+
+        cmp rax, 0;
+        jl  mv_uw_fail;                          // negative errno
+
+        // ---- Success --------------------------------------------------------
+        mov rdi, 13;                             // MV_ST_UNDO_RECORDS
+        call mv_note;
+        xor rax, rax;                            // MV_OK
+        add rsp, 8;
+        ret;
+
+      mv_uw_fail:
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB71;                     // MV_UND_WRITE_FAIL
+        add rsp, 8;
+        ret
+      }
+    }
+}

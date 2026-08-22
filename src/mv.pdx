@@ -172,6 +172,13 @@ module Mv = structure {
   pub let MV_AUD_LOOKUP_FAIL       : u64 = 0xFFFFEB61   // sys_svc_lookup neg errno
   pub let MV_AUD_SEND_FAIL         : u64 = 0xFFFFEB62   // sys_ipc_send neg errno
 
+  // Undo (M3-003) codes (0xFFFFEB7x). PdxFS v1 undo-record write
+  // failures. Bodies live in src/undo.pdx (module Undo). Best-
+  // effort: an undo-write failure does NOT abort the TXN (I5
+  // uplift; the audit journal at M3-002 still records the op).
+  pub let MV_UND_STUB              : u64 = 0xFFFFEB70   // reserved
+  pub let MV_UND_WRITE_FAIL        : u64 = 0xFFFFEB71   // pdxfs_txn_write_undo neg errno
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
@@ -196,7 +203,8 @@ module Mv = structure {
   //  10 MV_ST_INODE_REKEYED     (M2-004) signed-inode re-sign successes
   //  11 MV_ST_RECORDS_EMITTED   (M3-001) Schema::mv_schema_emit successes
   //  12 MV_ST_AUDIT_WRITES      (M3-002) Audit::mv_audit_write_move successes
-  //  13..15 reserved             for M3-003..M3-004
+  //  13 MV_ST_UNDO_RECORDS      (M3-003) Undo::mv_undo_write successes
+  //  14..15 reserved             for M3-004
   //
   // Cache-line alignment matches _shell_stats / _elevate_broker_stats
   // -- keeps a future SMP counter path a mechanical widening rather
@@ -218,6 +226,7 @@ module Mv = structure {
   pub let MV_ST_INODE_REKEYED    : u64 = 10
   pub let MV_ST_RECORDS_EMITTED  : u64 = 11
   pub let MV_ST_AUDIT_WRITES     : u64 = 12
+  pub let MV_ST_UNDO_RECORDS     : u64 = 13
   pub let MV_ST_MAX              : u64 = 16
 
   // ==========================================================================

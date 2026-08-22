@@ -581,6 +581,20 @@ module Move = structure {
         cmp rax, 0;
         jne mv_md_audit_fail;
 
+        // ---- Step 6f (M3-003): PdxFS v1 undo record -------------------------
+        // Best-effort: an undo-write failure does NOT abort the TXN
+        // (I5 uplift; the audit journal at M3-002 still records the
+        // operation, so the mv is still accountable -- the missing
+        // undo just means `pdx-undo` cannot replay it automatically).
+        // Populate with SWAPPED paths so the replay `mv <replay_src>
+        // <replay_dst>` invokes `mv <original_dst> <original_src>`.
+        call mv_undo_reset;
+        mov rdi, rbx;                        // src_ptr (original src)
+        mov rsi, r12;                        // dst_ptr (original dst)
+        call mv_undo_populate;
+        mov rdi, r15;                        // txn_handle
+        call mv_undo_write;
+
         // ---- Step 7: commit TXN ---------------------------------------------
         mov rdi, r15;                        // txn
         call pdxfs_txn_commit;
