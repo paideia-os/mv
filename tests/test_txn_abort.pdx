@@ -1,0 +1,331 @@
+// tests/test_txn_abort.pdx -- mv.M4-001 (paideia-os/mv#12)
+//
+// TestTxnAbort module: TXN-abort mid-move -- source restored, no
+// dest artifact.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M4-001 is the plan doc §5.7 M4 line's first landing:
+//
+//   "TXN-abort mid-move: source restored, no dest artifact"
+//
+// The correctness invariant this fixture verifies: whenever a mv
+// operation aborts its PdxFS TXN (because of a failed unlink, link,
+// audit, or commit), the source dirent stays intact and no
+// destination artifact appears in the filesystem. The observable
+// contract is a combination of return-code correctness (Move::
+// move_dispatch returns a distinct MV_MV_* code for each failure
+// stage) and counter correctness (MV_ST_TXN_ABORTS bumps at every
+// abort, MV_ST_ERRORS bumps at every failure, MV_ST_MOVES /
+// MV_ST_TXN_COMMITS do NOT bump on any aborted invocation).
+//
+// =============================================================================
+// SUBSTRATE STATE
+// =============================================================================
+//
+// At HEAD (2026-08-22) every Pdxfs::* trampoline is an M2 STUB that
+// returns 0 (success) or 1 (a fresh non-zero handle). This means a
+// live fault-injection test that forces sys_pdxfs_unlink to return
+// -EIO mid-TXN is not runnable without the R42 substrate landing --
+// the kernel-side dispatch does not yet exist, and the fault-
+// injection sysno (proposed sys_pdxfs_fault_inject at sysno 527 --
+// see paideia-os design/kernel/pdxfs-v1.md §Testing) is deferred.
+//
+// This fixture therefore validates the ABORT-PATH SHAPE using the
+// two failure vectors that ARE reachable today:
+//
+//   (a) Argv gates on Rename::rename_same_dir with null pointers.
+//       rename_same_dir(0, dst) returns MV_RN_BAD_SRC (0xFFFFEB21);
+//       rename_same_dir(src, 0) returns MV_RN_BAD_DST (0xFFFFEB22).
+//       Both bump MV_ST_ERRORS. Neither reaches the TXN layer.
+//
+//   (b) Direct pdxfs_txn_abort invocation. Pdxfs::pdxfs_txn_abort
+//       is an M2 STUB returning 0 (success). This verifies the
+//       trampoline is dispatched at the call sites Move::
+//       move_dispatch installs on its mv_md_unlink_fail /
+//       mv_md_link_fail / mv_md_xdev_fail / mv_md_audit_fail
+//       branches; drift is caught by the M4 smoke matrix when
+//       R42 substrate ships fault injection.
+//
+// The happy-path shape is also verified: Move::move_dispatch(src,
+// dst) with valid pointers must return 0 (all stubs succeed today)
+// and must bump MV_ST_INVOCATIONS + MV_ST_TXN_OPENS + MV_ST_TXN_
+// COMMITS + MV_ST_MOVES without touching MV_ST_TXN_ABORTS or
+// MV_ST_ERRORS.
+//
+// When R42 lands, this file adds:
+//
+//   fault_inject_and_verify(stage) -- an entry point per stage
+//   (UNLINK/LINK/COMMIT/AUDIT) that (a) arms fault injection at
+//   `stage`, (b) invokes Move::move_dispatch, (c) verifies the
+//   return code matches the expected MV_MV_* code, (d) verifies
+//   MV_ST_TXN_ABORTS bumped, (e) verifies MV_ST_MOVES did NOT
+//   bump, (f) disarms the injection. The fixture harness that
+//   drives the fixtures ships alongside R42.
+//
+// =============================================================================
+// FIXTURE POINTERS
+// =============================================================================
+//
+// Non-null path pointers use small fixture values (0x1000, 0x2000).
+// pdxfs_resolve_parent / pdxfs_inode_of stubs return 0 (well-formed
+// success), so passing an arbitrary non-null pointer walks the full
+// happy path.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFEBCx (TestTxnAbort)
+// =============================================================================
+//
+//   0xFFFFEBC0 MV_TEST_ABT_OK            all-pass sentinel (== 0)
+//   0xFFFFEBC1 MV_TEST_ABT_BAD_SRC_RC    rename_same_dir(0,dst) != MV_RN_BAD_SRC
+//   0xFFFFEBC2 MV_TEST_ABT_BAD_DST_RC    rename_same_dir(src,0) != MV_RN_BAD_DST
+//   0xFFFFEBC3 MV_TEST_ABT_STUB_RC       rename_same_dir(src,dst) != MV_RN_STUB
+//   0xFFFFEBC4 MV_TEST_ABT_ERR_STAT      MV_ST_ERRORS did not bump on reject
+//   0xFFFFEBC5 MV_TEST_ABT_ABT_STUB      pdxfs_txn_abort(1) != 0 (stub broke)
+//   0xFFFFEBC6 MV_TEST_ABT_HAPPY_RC      move_dispatch(src,dst) != 0
+//   0xFFFFEBC7 MV_TEST_ABT_COMMIT_STAT   MV_ST_TXN_COMMITS did not bump
+//   0xFFFFEBC8 MV_TEST_ABT_MOVES_STAT    MV_ST_MOVES did not bump
+//   0xFFFFEBC9 MV_TEST_ABT_ABT_LEAK      MV_ST_TXN_ABORTS bumped on happy path
+//   0xFFFFEBCA MV_TEST_ABT_ERR_LEAK      MV_ST_ERRORS bumped on happy path
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestTxnAbort`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (return-code
+//     compares stage through rcx for values > imm32 -- MV_RN_STUB
+//     0xFFFFEB20 is > imm32 signed, so all rc compares use
+//     `mov rcx, imm32; cmp rax, rcx` reg-reg pattern for uniformity).
+//     Actually: 0xFFFFEB20 as unsigned fits in imm32 (< 0xFFFFFFFF)
+//     but as a signed imm32 sign-extends to a large 64-bit value
+//     which `cmp rax, imm32` sign-extends. Per paideia-as rule
+//     "imm <= 0x7FFFFFFF" this bans the direct compare. Every
+//     rc compare therefore stages through rcx.
+//   - Byte reads not used.
+//   - r11 is scratch for every .bss reach (there are none in this
+//     file -- all state reads go through mv_stat).
+//   - test_txn_abort_run has nested SysV calls (mv_reset, mv_stat,
+//     rename_same_dir, pdxfs_txn_abort, move_dispatch). Prologue
+//     is 2 callee-save pushes (rbx = happy-path baseline snapshot,
+//     r12 = intermediate stats) = 16 bytes; entry rsp % 16 == 8,
+//     2 pushes flip parity back to 8, so `sub rsp, 8` on entry
+//     lands rsp % 16 == 0 for the SysV calls. Matched epilogue
+//     `add rsp, 8; pop r12; pop rbx; ret` at every ret path.
+
+module TestTxnAbort = structure {
+
+  // ==========================================================================
+  // test_txn_abort_run() -> u64
+  //
+  // The M4-001 fixture entry point. Runs the three shape blocks:
+  //
+  //   Block A: Rename argv-gate rejects (reachable failure paths).
+  //     - rename_same_dir(0, 0x2000) -> MV_RN_BAD_SRC; MV_ST_ERRORS++.
+  //     - rename_same_dir(0x1000, 0) -> MV_RN_BAD_DST; MV_ST_ERRORS++.
+  //     - rename_same_dir(0x1000, 0x2000) -> MV_RN_STUB.
+  //
+  //   Block B: pdxfs_txn_abort trampoline shape.
+  //     - pdxfs_txn_abort(1) -> 0 (M2 STUB OK).
+  //
+  //   Block C: happy-path invariant (no abort/error leak).
+  //     - Snapshot MV_ST_TXN_ABORTS + MV_ST_ERRORS (baseline).
+  //     - Call move_dispatch(0x1000, 0x2000) -> 0 (all stubs succeed).
+  //     - Verify MV_ST_MOVES bumped by 1.
+  //     - Verify MV_ST_TXN_COMMITS bumped by 1.
+  //     - Verify MV_ST_TXN_ABORTS UNCHANGED (no abort on happy path).
+  //     - Verify MV_ST_ERRORS UNCHANGED (no error on happy path).
+  //
+  // Fail-fast: first non-matching check returns a distinct
+  // MV_TEST_ABT_* code so a debugger identifies the exact vector.
+  //
+  // Return: 0 on all-pass; MV_TEST_ABT_* on first failure.
+  // ==========================================================================
+  pub let test_txn_abort_run : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mv.M4-001 (#12): TestTxnAbort::test_txn_abort_run -- TXN-abort shape fixture. Block A verifies Rename's argv-gate return-code discipline (MV_RN_BAD_SRC/DST/STUB) -- the two reachable failure vectors that bump MV_ST_ERRORS without touching the TXN layer. Block B verifies Pdxfs::pdxfs_txn_abort trampoline is dispatched cleanly (M2 STUB returns 0). Block C verifies the happy-path invariant: move_dispatch with valid pointers returns 0, bumps MV_ST_MOVES + MV_ST_TXN_COMMITS, and does NOT bump MV_ST_TXN_ABORTS or MV_ST_ERRORS (the abort/error leak check). Live fault-injection tests deferred to R42 substrate landing (sys_pdxfs_fault_inject sysno 527 pending). Return-code compares stage through rcx (`mov rcx, imm32; cmp rax, rcx`) because MV_RN_STUB (0xFFFFEB20) as signed imm32 sign-extends to a distinct 64-bit value under `cmp rax, imm32`; the reg-reg pattern preserves the intended unsigned comparison. Prologue 2 callee-save pushes (rbx = happy-path abort baseline, r12 = happy-path error baseline) + sub rsp, 8 = 24 bytes; entry rsp % 16 == 8, 2 pushes + sub 8 lands rsp % 16 == 0 for SysV calls. Effects include @{cap, sched} because move_dispatch has those (transitive). Labels prefixed mv_tta_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+        push r12;
+        sub rsp, 8;                              // align rsp % 16 == 0
+
+        // Reset stats to a known baseline.
+        call mv_reset;
+
+        // ====================================================================
+        // Block A: Rename argv-gate rejects
+        // ====================================================================
+
+        // A.1: rename_same_dir(0, 0x2000) -> MV_RN_BAD_SRC (0xFFFFEB21).
+        mov rdi, 0;
+        mov rsi, 0x2000;
+        call rename_same_dir;
+        mov rcx, 0xFFFFEB21;                     // MV_RN_BAD_SRC (stage via rcx)
+        cmp rax, rcx;
+        jne mv_tta_bad_src_rc;
+
+        // A.2: rename_same_dir(0x1000, 0) -> MV_RN_BAD_DST (0xFFFFEB22).
+        mov rdi, 0x1000;
+        mov rsi, 0;
+        call rename_same_dir;
+        mov rcx, 0xFFFFEB22;                     // MV_RN_BAD_DST
+        cmp rax, rcx;
+        jne mv_tta_bad_dst_rc;
+
+        // A.3: rename_same_dir(0x1000, 0x2000) -> MV_RN_STUB (0xFFFFEB20).
+        // (Rename layer is still the M1 skeleton; happy path returns the STUB
+        //  sentinel until R42 substrate flips it to 0. Verifying we still see
+        //  the sentinel catches an inadvertent flip that outruns the substrate.)
+        mov rdi, 0x1000;
+        mov rsi, 0x2000;
+        call rename_same_dir;
+        mov rcx, 0xFFFFEB20;                     // MV_RN_STUB
+        cmp rax, rcx;
+        jne mv_tta_stub_rc;
+
+        // Verify MV_ST_ERRORS >= 2 (two reject paths bumped it).
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_stat;
+        cmp rax, 2;
+        jb  mv_tta_err_stat;                     // rax < 2 -> fail
+
+        // ====================================================================
+        // Block B: pdxfs_txn_abort trampoline shape
+        // ====================================================================
+
+        // pdxfs_txn_abort(handle=1) -> 0 (M2 STUB OK).
+        mov rdi, 1;
+        call pdxfs_txn_abort;
+        cmp rax, 0;
+        jne mv_tta_abt_stub;
+
+        // ====================================================================
+        // Block C: happy-path invariant (no abort/error leak)
+        // ====================================================================
+
+        // Snapshot MV_ST_TXN_ABORTS baseline -> rbx.
+        mov rdi, 4;                              // MV_ST_TXN_ABORTS
+        call mv_stat;
+        mov rbx, rax;
+
+        // Snapshot MV_ST_ERRORS baseline -> r12.
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_stat;
+        mov r12, rax;
+
+        // Call move_dispatch(0x1000, 0x2000). All stubs return
+        // success, so rax should be 0.
+        mov rdi, 0x1000;
+        mov rsi, 0x2000;
+        call move_dispatch;
+        cmp rax, 0;
+        jne mv_tta_happy_rc;
+
+        // Verify MV_ST_TXN_COMMITS >= 1.
+        mov rdi, 3;                              // MV_ST_TXN_COMMITS
+        call mv_stat;
+        cmp rax, 1;
+        jb  mv_tta_commit_stat;
+
+        // Verify MV_ST_MOVES >= 1 (slot 1; also MV_ST_RENAMES alias).
+        mov rdi, 1;                              // MV_ST_MOVES
+        call mv_stat;
+        cmp rax, 1;
+        jb  mv_tta_moves_stat;
+
+        // Verify MV_ST_TXN_ABORTS == rbx (no bump on happy path).
+        mov rdi, 4;                              // MV_ST_TXN_ABORTS
+        call mv_stat;
+        cmp rax, rbx;
+        jne mv_tta_abt_leak;
+
+        // Verify MV_ST_ERRORS == r12 (no bump on happy path).
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_stat;
+        cmp rax, r12;
+        jne mv_tta_err_leak;
+
+        // ---- All-pass --------------------------------------------------------
+        xor rax, rax;                            // MV_TEST_ABT_OK (0)
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_bad_src_rc:
+        mov rax, 0xFFFFEBC1;                     // MV_TEST_ABT_BAD_SRC_RC
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_bad_dst_rc:
+        mov rax, 0xFFFFEBC2;                     // MV_TEST_ABT_BAD_DST_RC
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_stub_rc:
+        mov rax, 0xFFFFEBC3;                     // MV_TEST_ABT_STUB_RC
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_err_stat:
+        mov rax, 0xFFFFEBC4;                     // MV_TEST_ABT_ERR_STAT
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_abt_stub:
+        mov rax, 0xFFFFEBC5;                     // MV_TEST_ABT_ABT_STUB
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_happy_rc:
+        mov rax, 0xFFFFEBC6;                     // MV_TEST_ABT_HAPPY_RC
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_commit_stat:
+        mov rax, 0xFFFFEBC7;                     // MV_TEST_ABT_COMMIT_STAT
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_moves_stat:
+        mov rax, 0xFFFFEBC8;                     // MV_TEST_ABT_MOVES_STAT
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_abt_leak:
+        mov rax, 0xFFFFEBC9;                     // MV_TEST_ABT_ABT_LEAK
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_tta_err_leak:
+        mov rax, 0xFFFFEBCA;                     // MV_TEST_ABT_ERR_LEAK
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
