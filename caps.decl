@@ -56,21 +56,22 @@
 #                                    KIND_PDXFS_TXN = 0x196 (R42
 #                                    substrate).
 #
-# --- placeholder: elevate-broker binding -------------------------------
-# Reserved for the M3-004 wire-up (cross-user-boundary destination).
-# Uncomment when libpdx-elevate.M3 is in-tree and the paideia-os
-# elevate broker (R48.M7 at src/kernel/core/ipc/elevate_broker.pdx)
-# is running. M1's mv never crosses user boundaries — a mv onto a
-# path whose parent belongs to another user is refused with
-# MV_ARG_UNSUP at exec until M3.
-#
-#   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
+# --- elevate-broker binding (M3-004) -----------------------------------
+# Cross-user-boundary destination requires an elevate hop: mv borrows
+# KIND_USER(sign, dst_owner_key) from svc.elevate-broker for a 60s
+# window so pdxfs_inode_rebind_owner can re-sign the moved inode
+# under the destination-user's key. Best-effort HINT -- a refused
+# elevate falls through to the M2-004 graceful-degrade path (inode
+# keeps old owner tail; verbose diagnostic flags the degrade).
+# KIND_ELEVATE_CHANNEL = 0x191 (R48.M7 substrate at paideia-os
+# src/kernel/core/ipc/elevate_broker.pdx). Live at HEAD 2026-08-22.
 requires:
   - KIND_USER (self)
   - KIND_IPC_ENDPOINT (invoke)
   - KIND_PDXFS_FILE (write, <src-parent>)
   - KIND_PDXFS_FILE (write, <dst-parent>)
   - KIND_PDXFS_TXN (invoke, mint)
+  - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)
 
 # Declared output schemas — the semantic-pipe schema records mv emits
 # on stdout. M1 emits none (a successful same-dir rename is silent

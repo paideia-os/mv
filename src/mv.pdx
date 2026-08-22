@@ -179,6 +179,16 @@ module Mv = structure {
   pub let MV_UND_STUB              : u64 = 0xFFFFEB70   // reserved
   pub let MV_UND_WRITE_FAIL        : u64 = 0xFFFFEB71   // pdxfs_txn_write_undo neg errno
 
+  // Elevate (M3-004) codes (0xFFFFEB8x). libpdx-elevate broker-hop
+  // for cross-user-boundary dst. Bodies live in src/elevate.pdx
+  // (module Elevate). Best-effort HINT: a denied elevate does NOT
+  // fail the mv; Inode::mv_inode_preserve falls through to the
+  // existing M2-004 graceful-degrade path.
+  pub let MV_ELV_STUB              : u64 = 0xFFFFEB80   // reserved
+  pub let MV_ELV_LOOKUP_FAIL       : u64 = 0xFFFFEB81   // svc_lookup(svc.elevate-broker) failed
+  pub let MV_ELV_SEND_FAIL         : u64 = 0xFFFFEB82   // ipc_send to broker failed
+  pub let MV_ELV_DENIED            : u64 = 0xFFFFEB83   // broker refused the request
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
@@ -204,7 +214,8 @@ module Mv = structure {
   //  11 MV_ST_RECORDS_EMITTED   (M3-001) Schema::mv_schema_emit successes
   //  12 MV_ST_AUDIT_WRITES      (M3-002) Audit::mv_audit_write_move successes
   //  13 MV_ST_UNDO_RECORDS      (M3-003) Undo::mv_undo_write successes
-  //  14..15 reserved             for M3-004
+  //  14 MV_ST_ELEVATE_ATTEMPTS  (M3-004) Elevate::mv_elevate_cross_user entries
+  //  15 MV_ST_ELEVATE_GRANTS    (M3-004) Elevate::mv_elevate_cross_user grants
   //
   // Cache-line alignment matches _shell_stats / _elevate_broker_stats
   // -- keeps a future SMP counter path a mechanical widening rather
@@ -224,10 +235,12 @@ module Mv = structure {
   pub let MV_ST_CROSS_USER       : u64 = 8
   pub let MV_ST_INODE_PRESERVED  : u64 = 9
   pub let MV_ST_INODE_REKEYED    : u64 = 10
-  pub let MV_ST_RECORDS_EMITTED  : u64 = 11
-  pub let MV_ST_AUDIT_WRITES     : u64 = 12
-  pub let MV_ST_UNDO_RECORDS     : u64 = 13
-  pub let MV_ST_MAX              : u64 = 16
+  pub let MV_ST_RECORDS_EMITTED   : u64 = 11
+  pub let MV_ST_AUDIT_WRITES      : u64 = 12
+  pub let MV_ST_UNDO_RECORDS      : u64 = 13
+  pub let MV_ST_ELEVATE_ATTEMPTS  : u64 = 14
+  pub let MV_ST_ELEVATE_GRANTS    : u64 = 15
+  pub let MV_ST_MAX               : u64 = 16
 
   // ==========================================================================
   // mv_reset() -> ()

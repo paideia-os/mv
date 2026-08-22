@@ -1,0 +1,367 @@
+// src/elevate.pdx -- mv.M3-004 (paideia-os/mv#11)
+//
+// Elevate module: libpdx-elevate hop for cross-user-boundary dst.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M3-004 is the plan doc §5.7 M3 line's fourth landing:
+//
+//   "libpdx-elevate for cross-user boundary moves on the
+//    destination side."
+//
+// When mv crosses a per-user-subtree boundary on the destination
+// side (src_owner != dst_parent_owner, detected by Inode::
+// mv_inode_preserve at M2-004), the invoker's cap_table does not
+// hold KIND_USER(sign, dst_owner_key) by default. Without that
+// cap, pdxfs_inode_rebind_owner cannot re-sign the moved inode
+// under the destination-user's key, and the operation falls into
+// the graceful-degrade branch (inode keeps its old owner tail;
+// downstream tools on the destination side will refuse to open it
+// under the destination-user's identity).
+//
+// M3-004 inserts a HINT step BEFORE the rebind: attempt to
+// borrow KIND_USER(sign, dst_owner_key) from the system-wide
+// elevate broker (svc.elevate-broker, KIND_ELEVATE_CHANNEL =
+// 0x191 -- R48.M7 substrate at paideia-os
+// src/kernel/core/ipc/elevate_broker.pdx). The broker's policy
+// engine (D3 audit-first: every elevate is journaled with the
+// requester's identity + reason + duration) decides whether to
+// grant a 60-second window during which the invoker's cap_table
+// transiently holds the requested cap. If granted, the subsequent
+// pdxfs_inode_rebind_owner call succeeds and the destination-
+// user's ownership semantics are preserved.
+//
+// If the broker refuses (policy or absent-svc), mv falls through
+// to the existing M2-004 behavior: the rebind is attempted under
+// the invoker's own key (may still succeed if the invoker owns
+// the target subtree via another cap path); on failure, graceful
+// degrade with the verbose diagnostic.
+//
+// This module owns:
+//
+//   * The KIND_USER + KIND_ELEVATE_CHANNEL ordinal mirrors mv
+//     needs (0x190 and 0x191; mirrored from paideia-os
+//     src/kernel/core/cap/kind_user.pdx and elevate_broker.pdx).
+//   * The ElevateRequest fixed layout (a single 32-byte record;
+//     four u64 fields: magic + requested_kind + requested_key +
+//     duration_secs).
+//   * A .bss slot for the request buffer (mv_elevate_request).
+//   * A .bss slot for the cached broker endpoint handle
+//     (mv_elevate_endpoint).
+//   * mv_elevate_cross_user(dst_owner_key) -> u64 -- the main
+//     entry point. Called from Inode::mv_inode_preserve on the
+//     cross-user branch before pdxfs_inode_rebind_owner.
+//
+// The svc_lookup + ipc_send transport is shared with Audit -- both
+// modules call Audit::svc_lookup / Audit::ipc_send (R20b sysno
+// 43 / 42, live at HEAD). No trampoline duplication.
+//
+// =============================================================================
+// SUBSTRATE STATE
+// =============================================================================
+//
+// KIND_ELEVATE_CHANNEL (0x191) landed at R48.M7 in paideia-os
+// (src/kernel/core/ipc/elevate_broker.pdx). The elevate-broker
+// process itself is a supervisor bound to the "svc.elevate-broker"
+// name via sys_svc_register at boot. libpdx-elevate.M3 (the
+// crate that owns the client-side wire protocol) is scheduled at
+// R50 alongside mv itself; at HEAD (2026-08-21) it is not yet
+// in-tree. The M3-004 request payload is therefore a minimal
+// 32-byte record the broker's stub parser accepts; the R50
+// libpdx-elevate landing will swap to the full protocol (cap
+// ref, right, epoch, signing-cert -- see paideia-os
+// design/user/model.md §5).
+//
+// =============================================================================
+// REQUEST LAYOUT (32 bytes; four u64 fields; @align(8))
+// =============================================================================
+//
+//   Offset  Size  Field
+//        0     8  magic            = MV_ELV_REQUEST_MAGIC (schema tag)
+//        8     8  requested_kind   = ELV_KIND_USER (0x190)
+//       16     8  requested_key    (the dst_owner_key to sign under)
+//       24     8  duration_secs    (MV_ELV_WINDOW_SECS = 60)
+//
+// The broker validates magic, then consults its policy for the
+// (invoker_identity, requested_kind, requested_key, duration)
+// tuple. A grant response minted the cap into the invoker's
+// cap_table synchronously (visible to the very next syscall);
+// a refuse response returns a non-zero errno.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Elevate`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 60 appear).
+//   - Byte reads not used (svc name passed by pointer + length).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - mv_elevate_reset + mv_elevate_populate are LEAF functions;
+//     mv_elevate_cross_user has two nested SysV calls (svc_lookup,
+//     ipc_send); prologue `sub rsp, 8` for alignment.
+
+module Elevate = structure {
+
+  // ==========================================================================
+  // KIND ordinal mirrors
+  //
+  //   ELV_KIND_USER      0x190  R48.M1 substrate
+  //   ELV_KIND_CHANNEL   0x191  R48.M7 substrate (elevate-broker)
+  // ==========================================================================
+  pub let ELV_KIND_USER    : u64 = 0x190
+  pub let ELV_KIND_CHANNEL : u64 = 0x191
+
+  // ==========================================================================
+  // Elevate window duration (seconds)
+  //
+  // 60s matches design/user/model.md §5.1 example
+  // ("KIND_PDXFS_FILE(write, /pkgs) + ... for a 60s window").
+  // ==========================================================================
+  pub let MV_ELV_WINDOW_SECS : u64 = 60
+
+  // ==========================================================================
+  // Request layout constants
+  //
+  // Documentation only -- the populate asm below uses literal offsets.
+  // ==========================================================================
+  pub let MV_ELV_REQUEST_SIZE  : u64 = 32
+
+  pub let ERO_MAGIC            : u64 = 0
+  pub let ERO_REQUESTED_KIND   : u64 = 8
+  pub let ERO_REQUESTED_KEY    : u64 = 16
+  pub let ERO_DURATION_SECS    : u64 = 24
+
+  // ==========================================================================
+  // ElevateRequest magic / schema id
+  //
+  // High 32 bits = 0xFFFFEB80 (mv's Elevate-band tag). Low 32 bits =
+  // 0x00000001 (schema version 1). Parallel structure to Schema and
+  // Undo magics.
+  // ==========================================================================
+  pub let MV_ELV_REQUEST_MAGIC : u64 = 0xFFFFEB8000000001
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEB8x (Elevate layer)
+  //
+  //   0xFFFFEB80 MV_ELV_STUB          reserved
+  //   0xFFFFEB81 MV_ELV_LOOKUP_FAIL   sys_svc_lookup(svc.elevate-broker) failed
+  //   0xFFFFEB82 MV_ELV_SEND_FAIL     sys_ipc_send to elevate-broker failed
+  //   0xFFFFEB83 MV_ELV_DENIED        broker returned a refuse response
+  // ==========================================================================
+  pub let MV_ELV_STUB         : u64 = 0xFFFFEB80
+  pub let MV_ELV_LOOKUP_FAIL  : u64 = 0xFFFFEB81
+  pub let MV_ELV_SEND_FAIL    : u64 = 0xFFFFEB82
+  pub let MV_ELV_DENIED       : u64 = 0xFFFFEB83
+
+  // ==========================================================================
+  // svc name literal
+  //
+  // "svc.elevate-broker\0\0" -- 20 bytes, 18-char name + 2-pad NUL to
+  // keep the buffer u64-aligned. Same discipline as Audit::
+  // SVC_AUDIT_JOURNAL_NAME.
+  // ==========================================================================
+  pub let SVC_ELEVATE_BROKER_NAME     : [u8; 20] = "svc.elevate-broker\0\0"
+  pub let SVC_ELEVATE_BROKER_NAME_LEN : u64 = 18
+
+  // ==========================================================================
+  // Storage
+  // ==========================================================================
+  pub let mut mv_elevate_endpoint : u64        = uninit @align(8)
+  pub let mut mv_elevate_request  : [u8; 32]   = uninit @align(8)
+
+  // ==========================================================================
+  // mv_elevate_reset() -> ()
+  //
+  // Zero the four u64 slots inside mv_elevate_request. Leaf; r11
+  // scratch. The endpoint cache (mv_elevate_endpoint) is preserved
+  // across resets -- one lookup per mv invocation is enough.
+  // ==========================================================================
+  pub let mv_elevate_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M3-004 (#11): zero the four-u64 mv_elevate_request buffer so a subsequent mv_elevate_populate starts empty. Four `mov [r11 + off], rax` stores at offsets 0/8/16/24 (matches Schema and Undo reset idiom). r11 scratch. Leaf function -- no push/pop parity. mv_elevate_endpoint intentionally NOT cleared -- the broker's endpoint stays cached for the whole mv invocation (mirrors Audit::mv_audit_endpoint discipline).",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + mv_elevate_request];
+        mov [r11 + 0], rax;
+        mov [r11 + 8], rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_elevate_populate(dst_owner_key) -> ()
+  //
+  // Fill the ElevateRequest slot with the fixed magic + kind +
+  // duration and the caller-supplied dst_owner_key.
+  //
+  // RDI (input): dst_owner_key -- the KIND_USER key whose signing
+  //                               authority mv wants to borrow for
+  //                               MV_ELV_WINDOW_SECS.
+  //
+  // Leaf; no nested calls. r11 scratch. All magic / kind / duration
+  // values are literal immediates; the imm64 magic uses `mov r64, imm64`.
+  // ==========================================================================
+  pub let mv_elevate_populate : (u64) -> () !{mem} @{} =
+    fn (dst_owner_key: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M3-004 (#11): populate ElevateRequest with fixed magic (0xFFFFEB8000000001) + requested_kind (0x190 = ELV_KIND_USER) + requested_key (rdi = dst_owner_key) + duration_secs (60 = MV_ELV_WINDOW_SECS). Four field stores at literal offsets 0/8/16/24. MV_ELV_REQUEST_MAGIC uses `mov r64, imm64` encoding. r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      block: {
+        // ---- Field 0: magic --------------------------------------------------
+        mov rax, 0xFFFFEB8000000001;             // MV_ELV_REQUEST_MAGIC (imm64)
+        lea r11, [rip + mv_elevate_request];
+        mov [r11 + 0], rax;
+
+        // ---- Field 8: requested_kind = ELV_KIND_USER (0x190) ----------------
+        mov rax, 0x190;
+        mov [r11 + 8], rax;
+
+        // ---- Field 16: requested_key = rdi (dst_owner_key) ------------------
+        mov [r11 + 16], rdi;
+
+        // ---- Field 24: duration_secs = MV_ELV_WINDOW_SECS (60) --------------
+        mov rax, 60;
+        mov [r11 + 24], rax;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_elevate_cross_user(dst_owner_key) -> u64
+  //
+  // Look up the elevate broker if needed, populate the request,
+  // send it via sys_ipc_send. The broker's response is transmitted
+  // synchronously as the sys_ipc_send return code: 0 = grant, non-
+  // zero = refuse (specific errno indicates why: -EPERM = policy,
+  // -ENOENT = svc absent, etc.).
+  //
+  // RDI (input): dst_owner_key -- the KIND_USER key mv wants to
+  //                               borrow signing authority for.
+  //
+  // Return:
+  //   0                  on grant (invoker's cap_table now transiently
+  //                      holds KIND_USER(sign, dst_owner_key) for
+  //                      MV_ELV_WINDOW_SECS)
+  //   MV_ELV_LOOKUP_FAIL svc.elevate-broker not found or lookup refused
+  //   MV_ELV_SEND_FAIL   sys_ipc_send transport-level refuse (BAD_ID,
+  //                      CHANDEAD, etc.)
+  //   MV_ELV_DENIED      broker's policy refused the request (the
+  //                      grant response returned a non-zero body)
+  //
+  // Bumps MV_ST_ELEVATE_ATTEMPTS (slot 14) unconditionally on entry;
+  // MV_ST_ELEVATE_GRANTS (slot 15) on success. MV_ST_ERRORS on any
+  // failure branch.
+  //
+  // Best-effort from the caller's view: Inode::mv_inode_preserve does
+  // not gate its rebind attempt on the elevate outcome -- the elevate
+  // is a HINT that improves the rebind's success probability. A
+  // denied elevate falls through to the M2-004 graceful-degrade path.
+  //
+  // Register plan:
+  //   rbx = dst_owner_key (preserved across calls)
+  //   rax = call return
+  //   rdi/rsi/rdx/rcx = SysV args to nested calls
+  //   r11 = LEA scratch
+  //
+  // Prologue: 1 callee-save push (rbx) + `sub rsp, 8` for alignment
+  // = 16 bytes. Entry rsp % 16 == 8; 1 push -> 0; sub 8 -> 8; wait
+  // that's wrong. Let me redo: entry rsp % 16 == 8. 1 push (8 bytes)
+  // -> rsp % 16 == 0. Now sub 8 -> rsp % 16 == 8. That's WRONG for
+  // SysV callees which want rsp % 16 == 0 at their entry.
+  //
+  // Corrected prologue: 1 callee-save push (rbx) only, no sub. That
+  // leaves rsp % 16 == 0 for the nested calls. Matched 1-pop epilogue.
+  // Odd-count push idiom, same as cp copy_single_file.
+  // ==========================================================================
+  pub let mv_elevate_cross_user : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (dst_owner_key: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mv.M3-004 (#11): mv_elevate_cross_user -- broker-hop for cross-user boundary dst. Bumps MV_ST_ELEVATE_ATTEMPTS on entry (slot 14). Cold-cache miss on mv_elevate_endpoint triggers svc_lookup with SVC_ELEVATE_BROKER_NAME + length 18; success caches the returned cap_slot. Then mv_elevate_populate(rbx) fills the 32-byte ElevateRequest; ipc_send(slot, 0, request, 32) sends it. The broker's response arrives synchronously in rax: 0 = grant (bump MV_ST_ELEVATE_GRANTS slot 15, return 0), non-zero = refuse (return MV_ELV_DENIED). Transport-level failures (svc_lookup neg errno, ipc_send neg errno) map to MV_ELV_LOOKUP_FAIL / MV_ELV_SEND_FAIL. All failures bump MV_ST_ERRORS. Prologue is ONE callee-save push (rbx = dst_owner_key) preserving it across the nested calls; odd-count push idiom lands rsp % 16 == 0 without needing a sub (entry rsp % 16 == 8; 1 push flips parity to 0; matches cp copy_single_file and move_dispatch's 5-push idiom). Matched 1-pop epilogue. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears). @{cap} because svc_lookup mints a KIND_IPC_ENDPOINT cap and ipc_send consumes it; the broker's grant transiently mints KIND_USER into the caller's cap_table (visible on next syscall). Labels prefixed mv_ec_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+
+        mov rbx, rdi;                            // rbx = dst_owner_key
+
+        // ---- Bump MV_ST_ELEVATE_ATTEMPTS -------------------------------------
+        mov rdi, 14;                             // MV_ST_ELEVATE_ATTEMPTS
+        call mv_note;
+
+        // ---- Cold-cache: look up the elevate-broker endpoint ----------------
+        lea r11, [rip + mv_elevate_endpoint];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mv_ec_have_slot;                     // already cached
+
+        // Lookup: svc_lookup(SVC_ELEVATE_BROKER_NAME, SVC_ELEVATE_BROKER_NAME_LEN).
+        lea rdi, [rip + SVC_ELEVATE_BROKER_NAME];
+        mov rsi, 18;                             // SVC_ELEVATE_BROKER_NAME_LEN
+        call svc_lookup;
+
+        cmp rax, 0;
+        jl  mv_ec_lookup_fail;                   // negative errno
+
+        // Cache the slot.
+        lea r11, [rip + mv_elevate_endpoint];
+        mov [r11], rax;
+
+      mv_ec_have_slot:
+        // ---- Populate the request buffer ------------------------------------
+        call mv_elevate_reset;
+        mov rdi, rbx;                            // dst_owner_key
+        call mv_elevate_populate;
+
+        // ---- Send the request -----------------------------------------------
+        lea r11, [rip + mv_elevate_endpoint];
+        mov rdi, [r11];                          // cap_slot
+        mov rsi, 0;                              // hdr_va (none at M3-004)
+        lea rdx, [rip + mv_elevate_request];     // payload_va
+        mov rcx, 32;                             // payload_len (MV_ELV_REQUEST_SIZE)
+        call ipc_send;
+
+        // Transport-level failure -> MV_ELV_SEND_FAIL.
+        cmp rax, 0;
+        jl  mv_ec_send_fail;                     // negative errno
+
+        // Broker refuse -> MV_ELV_DENIED. A non-zero non-negative
+        // return here is a broker-level refuse (specific policy code
+        // in low byte); mv does not decode it -- MV_ELV_DENIED is
+        // enough for the caller.
+        jne mv_ec_denied;
+
+        // ---- Grant path -----------------------------------------------------
+        mov rdi, 15;                             // MV_ST_ELEVATE_GRANTS
+        call mv_note;
+        xor rax, rax;                            // MV_OK
+        pop rbx;
+        ret;
+
+      mv_ec_lookup_fail:
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB81;                     // MV_ELV_LOOKUP_FAIL
+        pop rbx;
+        ret;
+
+      mv_ec_send_fail:
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB82;                     // MV_ELV_SEND_FAIL
+        pop rbx;
+        ret;
+
+      mv_ec_denied:
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB83;                     // MV_ELV_DENIED
+        pop rbx;
+        ret
+      }
+    }
+}

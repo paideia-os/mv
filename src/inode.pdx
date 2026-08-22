@@ -129,11 +129,33 @@ module Inode = structure {
 
         // ---- Cross-user path ------------------------------------------------
         // 4a: set was_cross_user flag for the verbose diagnostic.
+        // rax holds dst_owner_key here (from step 2). Preserve it
+        // across the flag-set below by re-loading dst_owner from a
+        // fresh pdxfs_inode_owner call after the flag store.
+        //
+        // Actually: reuse r13 -- src_owner is no longer needed on
+        // this branch (we've already decided we're cross-user).
+        mov r13, rax;                        // r13 = dst_owner_key (stash)
+
         mov rax, 1;
         lea r11, [rip + mv_move_was_cross_user];
         mov [r11], rax;
 
-        // 4b: fetch invoker key (reuse r13 for the new value).
+        // ---- Step 4a-elevate (M3-004): request cross-user cap ---------------
+        // Best-effort HINT to the elevate broker. On grant, the
+        // invoker's cap_table transiently holds KIND_USER(sign,
+        // dst_owner_key) for 60s; the subsequent pdxfs_inode_rebind_
+        // owner call has a much higher success probability. On
+        // refuse, fall through to the existing M2-004 sequence
+        // (rebind under invoker; graceful degrade on failure).
+        //
+        // Return value discarded -- Elevate::mv_elevate_cross_user
+        // bumps its own stats (attempts + grants) internally.
+        mov rdi, r13;                        // dst_owner_key
+        call mv_elevate_cross_user;
+
+        // 4b: fetch invoker key (overwrite r13 -- dst_owner_key no
+        // longer needed after the elevate hop).
         call sys_user_self;
         mov r13, rax;                        // r13 = invoker_key
 

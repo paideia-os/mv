@@ -1,12 +1,12 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M3 (semantic-pipe / audit integration) — in progress
+**Current milestone:** M3 (semantic-pipe / audit integration) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
 
-## M3 — semantic-pipe / audit integration (in progress)
+## M3 — semantic-pipe / audit integration (complete)
 
 - `src/schema.pdx` (issue #8): Schema module — MoveRecord[] fixed
   layout (80 bytes; ten u64 fields at documented offsets) with
@@ -55,6 +55,34 @@ breakdown.
   write and BEFORE commit. Best-effort: a failed undo write does
   NOT abort the TXN (I5 uplift; the audit journal still records
   the operation, so the mv is still accountable).
+- `src/elevate.pdx` (issue #11): Elevate module — libpdx-elevate
+  hop for cross-user-boundary dst. 32-byte ElevateRequest layout
+  (magic + requested_kind + requested_key + duration_secs) with
+  MV_ELV_REQUEST_MAGIC 0xFFFFEB8000000001. `mv_elevate_reset`
+  clears the request slot; `mv_elevate_populate(dst_owner_key)`
+  fills it with ELV_KIND_USER (0x190) + dst_owner_key + 60s
+  window; `mv_elevate_cross_user(dst_owner_key)` looks up
+  "svc.elevate-broker" (cached in mv_elevate_endpoint on first
+  call), sends the request via ipc_send, and returns 0 on grant
+  (broker transiently minted KIND_USER(sign, dst_owner_key) into
+  caller's cap_table for 60s) or MV_ELV_LOOKUP_FAIL / SEND_FAIL /
+  DENIED on refuse. Return-code band 0xFFFFEB8x. Adds
+  MV_ST_ELEVATE_ATTEMPTS (slot 14) + MV_ST_ELEVATE_GRANTS (slot
+  15). Reuses Audit::svc_lookup + Audit::ipc_send trampolines
+  (no duplication).
+- `src/inode.pdx` (issue #11): Inode::mv_inode_preserve's
+  cross-user branch calls mv_elevate_cross_user with the
+  dst_owner_key BEFORE sys_user_self + pdxfs_inode_rebind_owner.
+  Best-effort HINT: a denied elevate does NOT fail the mv --
+  falls through to the M2-004 graceful-degrade path (rebind
+  under invoker; on failure the inode keeps its old owner tail
+  and the verbose diagnostic flags the degrade). The 60s window
+  greatly increases the probability that the subsequent rebind
+  succeeds when the invoker holds the elevate-broker cap.
+- `caps.decl` (issue #11): the KIND_ELEVATE_CHANNEL (invoke,
+  svc.elevate-broker) placeholder is now a required cap. mv
+  refuses at exec-time cap_manifest_verify if the caller cannot
+  hand down the elevate-broker binding.
 
 ## M2 — core implementation (complete)
 
@@ -190,6 +218,10 @@ breakdown.
 | 0xFFFFEB62 | MV_AUD_SEND_FAIL         | Audit.M3-002: sys_ipc_send neg errno       |
 | 0xFFFFEB70 | MV_UND_STUB              | Undo.M3-003: reserved                      |
 | 0xFFFFEB71 | MV_UND_WRITE_FAIL        | Undo.M3-003: pdxfs_txn_write_undo neg errno|
+| 0xFFFFEB80 | MV_ELV_STUB              | Elevate.M3-004: reserved                   |
+| 0xFFFFEB81 | MV_ELV_LOOKUP_FAIL       | Elevate.M3-004: svc_lookup neg errno       |
+| 0xFFFFEB82 | MV_ELV_SEND_FAIL         | Elevate.M3-004: ipc_send neg errno         |
+| 0xFFFFEB83 | MV_ELV_DENIED            | Elevate.M3-004: broker refused             |
 
 ## Milestone rollup
 
@@ -205,8 +237,9 @@ breakdown.
 | M3-001 (#8)     | MoveRecord[] schema bind (was_rename, was_cross_device flags) | LANDED |
 | M3-002 (#9)     | MoveRecord via libpdx-audit before commit                     | LANDED |
 | M3-003 (#10)    | PdxFS v1 undo record (replay is mv <dst> <src>)               | LANDED |
+| M3-004 (#11)    | libpdx-elevate for cross-user-boundary dst                    | LANDED |
 
-## Upstream substrate (paideia-os, at HEAD 2026-08-21)
+## Upstream substrate (paideia-os, at HEAD 2026-08-22)
 
 - `KIND_USER = 0x190` — landed in R48.M1 at
   `src/kernel/core/cap/kind_user.pdx`.
