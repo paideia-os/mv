@@ -59,7 +59,7 @@
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
-//   - Module name PascalCase basename (`MvArgv`), no directory prefix.
+//   - Module name PascalCase basename (`Argv`), no directory prefix.
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The largest
 //     literal in this module is 32 (libpdx-argv MAX_FLAGS) which
@@ -74,7 +74,7 @@
 //     mv_note); one `sub rsp, 8` on entry balances rsp % 16 for the
 //     SysV calls, matching the elevate_client_lookup_broker idiom.
 
-module MvArgv = structure {
+module Argv = structure {
 
   // ==========================================================================
   // Storage
