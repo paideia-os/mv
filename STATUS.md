@@ -19,7 +19,12 @@ breakdown.
 - `design/architecture.md` (issue #1): full M1 spec covering all three
   modules plus the 0xFFFFEBxx band, the paideia-as conformance
   checklist, and the M4 test matrix.
-- `src/argv.pdx` (issue #2): PENDING.
+- `src/argv.pdx` (issue #2): `MvArgv` module — argv surface wrapping
+  libpdx-argv's `parse_argv`. Accepts flags `-v`, `-i`, `--dry-run`;
+  rejects unknown flags with `MV_ARG_UNKNOWN_FLAG` and wrong
+  positional counts with `MV_ARG_TOO_FEW_POS`. Stores parsed results
+  in mv-owned .bss slots (mv_argv_src / mv_argv_dst /
+  mv_argv_verbose / mv_argv_interactive / mv_argv_dry_run).
 - `src/rename.pdx` (issue #3): PENDING.
 
 ## Return-code band 0xFFFFEBxx
@@ -46,7 +51,7 @@ breakdown.
 | ID              | Title                                                         | State  |
 |-----------------|---------------------------------------------------------------|--------|
 | M1-001 (#1)     | scaffold + caps.decl (src-parent + dst-parent write + TXN)    | LANDED |
-| M1-002 (#2)     | argv surface via libpdx-argv (mv [-v|-i|--dry-run])           | OPEN   |
+| M1-002 (#2)     | argv surface via libpdx-argv (mv [-v|-i|--dry-run])           | LANDED |
 | M1-003 (#3)     | first runnable: same-dir rename in single TXN                 | OPEN   |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)

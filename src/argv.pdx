@@ -1,0 +1,337 @@
+// src/argv.pdx -- mv.M1-002 (paideia-os/mv#2)
+//
+// MvArgv module: argv surface for mv, wrapping libpdx-argv.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv is invoked as `mv [-v|-i|--dry-run] <src> <dst>`. At M1 the M1
+// rename dispatch handles only same-directory rename with exactly one
+// source and one destination -- the multi-source form
+// `mv f1 f2 ... dir/` lands at M2 alongside cross-directory move.
+//
+// This module does the argv → typed-decision reduction:
+//
+//   1. Reset libpdx-argv's ParsedArgs singleton and dispatch
+//      Parser::parse_argv on the caller's argv array.
+//   2. Walk libpdx-argv's flag_names / flag_count and byte-compare
+//      every observed flag name against the mv whitelist:
+//        "v"        → mv_argv_verbose = 1
+//        "i"        → mv_argv_interactive = 1
+//        "dry-run"  → mv_argv_dry_run = 1
+//      Any other name → MV_ARG_UNKNOWN_FLAG, with the offending
+//      flag_names index recorded to mv_argv_error_flag_index for
+//      the M2 stderr diagnostic renderer.
+//   3. Walk libpdx-argv's pos_count. Exactly two positionals are
+//      required at M1; anything else → MV_ARG_TOO_FEW_POS. The two
+//      pointers land in mv_argv_src / mv_argv_dst.
+//
+// The mv-owned .bss slots (mv_argv_src / mv_argv_dst / three
+// booleans) are the ONE-WAY handoff between MvArgv and Rename --
+// Rename does not read libpdx-argv's ParsedArgs; a subsequent
+// mv_argv_parse call would clobber ParsedArgs but not the mv-owned
+// slots, so a caller that wants to re-parse must call
+// mv_argv_reset explicitly (the M4 fixture harness does this
+// before each fixture).
+//
+// =============================================================================
+// LIBPDX-ARGV LINKAGE
+// =============================================================================
+//
+// libpdx-argv exposes its ParsedArgs storage under unqualified
+// linker names (see libpdx-argv/src/parsed_args.pdx and its parser
+// consumer at libpdx-argv/src/parser.pdx §"Cross-module symbols"):
+//
+//   flag_names     : [u64; 32]  -- flag name pointers
+//   flag_values    : [u64; 32]  -- flag value pointers (0 for boolean)
+//   flag_count     : u64        -- how many entries in flag_names
+//   pos_ptrs       : [u64; 32]  -- positional argument pointers
+//   pos_count      : u64        -- how many entries in pos_ptrs
+//   error_code     : u64        -- parse_argv's own error code
+//   error_arg_index: u64        -- argv index where error was detected
+//
+// The two entry points MvArgv uses are ParsedArgs::reset and
+// Parser::parse_argv, both of which take arguments via SysV
+// (rdi/rsi) and return via rax.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`MvArgv`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The largest
+//     literal in this module is 32 (libpdx-argv MAX_FLAGS) which
+//     comfortably fits the small-imm window.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248
+//     mitigation). Every flag-name byte compare uses this pattern.
+//   - r11 is scratch and appears in every `lea r11, [rip + sym]` .bss
+//     reach.
+//   - SysV push/pop parity: mv_argv_reset is leaf; mv_argv_parse
+//     saves r12 (argc) + r13 (flag_idx cursor) + r14 (flag name ptr)
+//     + r15 (pos_count snapshot) across nested calls (parse_argv,
+//     mv_note); one `sub rsp, 8` on entry balances rsp % 16 for the
+//     SysV calls, matching the elevate_client_lookup_broker idiom.
+
+module MvArgv = structure {
+
+  // ==========================================================================
+  // Storage
+  //
+  // The five slots mv's Rename dispatch reads. Populated by
+  // mv_argv_parse from the ParsedArgs libpdx-argv fills. Consumers
+  // depend on the field NAMES, not on the storage class (mirrors
+  // the ParsedArgs discipline in libpdx-argv).
+  // ==========================================================================
+  pub let mut mv_argv_src               : u64 = uninit @align(8)   // pos[0]
+  pub let mut mv_argv_dst               : u64 = uninit @align(8)   // pos[1]
+  pub let mut mv_argv_verbose           : u64 = uninit @align(8)   // -v seen
+  pub let mut mv_argv_interactive       : u64 = uninit @align(8)   // -i seen
+  pub let mut mv_argv_dry_run           : u64 = uninit @align(8)   // --dry-run seen
+  pub let mut mv_argv_error_flag_index  : u64 = uninit @align(8)   // libpdx-argv index of offending flag
+
+  // ==========================================================================
+  // mv_argv_reset() -> ()
+  //
+  // Clear the six mv_argv_* slots so a subsequent mv_argv_parse
+  // starts from a known-zero baseline. Same idiom as ParsedArgs::
+  // reset in libpdx-argv. Leaf function; r11 scratch.
+  // ==========================================================================
+  pub let mv_argv_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M1-002 (#2): zero the six mv_argv_* slots so mv_argv_parse starts empty. xor rax,rax; six lea+mov to each slot. Same idiom as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. r11 is scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + mv_argv_src];              mov [r11], rax;
+        lea r11, [rip + mv_argv_dst];              mov [r11], rax;
+        lea r11, [rip + mv_argv_verbose];          mov [r11], rax;
+        lea r11, [rip + mv_argv_interactive];      mov [r11], rax;
+        lea r11, [rip + mv_argv_dry_run];          mov [r11], rax;
+        lea r11, [rip + mv_argv_error_flag_index]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_argv_parse(argc, argv) -> u64
+  //
+  // Signature: mv_argv_parse : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): argc  -- number of entries in argv[] (post program-name strip)
+  // RSI (input): argv  -- VA of the argv[] array (caller-owned)
+  // RAX (output): 0 on success, or one of the MV_ARG_* codes on error.
+  //
+  // The argv passed here starts at argv[1] in the ELF sense (program
+  // name already stripped by _start at M2). So for `mv -v a b`,
+  // argc = 3 and argv = ["-v", "a", "b"].
+  //
+  // Sequence:
+  //   (1) Bump MV_ST_INVOCATIONS.
+  //   (2) Gate argc != 0 and argv != 0 (paranoia; _start already
+  //       guarantees this, but a test harness calling into
+  //       mv_argv_parse directly can violate it).
+  //   (3) mv_argv_reset() and ParsedArgs::reset() so no stale state
+  //       from a prior invocation leaks in.
+  //   (4) Parser::parse_argv(argv, argc). If rax != 0 (an ERR_*
+  //       code), return MV_ARG_PARSE_ERR and bump MV_ST_ERRORS.
+  //   (5) Iterate flag_names[0..flag_count] and byte-compare each
+  //       against the whitelist {"v","i","dry-run"}. Unknown → return
+  //       MV_ARG_UNKNOWN_FLAG with mv_argv_error_flag_index set.
+  //   (6) Check pos_count == 2. If not, return MV_ARG_TOO_FEW_POS.
+  //   (7) Copy pos_ptrs[0] → mv_argv_src, pos_ptrs[1] → mv_argv_dst.
+  //   (8) Return 0.
+  //
+  // Register plan:
+  //   r12 = argc         (callee-save; preserved through parse_argv call)
+  //   r13 = argv         (callee-save; preserved through parse_argv call)
+  //   r14 = flag loop index k (0 .. flag_count)
+  //   r15 = current flag name pointer (flag_names[k])
+  //   rax = byte load / return scratch
+  //   rcx = whitelist compare-byte scratch
+  //   r10 = flag_count snapshot / pos_count snapshot
+  //   r11 = scratch (LEA target for every .bss reach; paideia-as reserved)
+  //
+  // Prologue: four callee-save pushes (r12..r15) + `sub rsp, 8` for
+  // alignment = 40 bytes. Post-prologue rsp % 16 == 0 for the
+  // nested parse_argv / mv_note calls. Matched epilogue.
+  // ==========================================================================
+  pub let mv_argv_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M1-002 (#2): argv surface for mv. Four callee-save pushes (r12=argc, r13=argv, r14=flag loop index, r15=flag name pointer) preserve state across nested SysV calls (mv_argv_reset, reset -- ParsedArgs, parse_argv -- Parser, mv_note). `sub rsp, 8` balances rsp % 16 to 0 for those calls, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). Whitelist compare is inline byte-by-byte against \"v\\0\", \"i\\0\", \"dry-run\\0\" -- same pattern libpdx-argv uses for pdx-schema in parser.pdx. Every byte read uses `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation). `cmp rax, 0x7F..` immediate byte values are all <= 0x7F, well under the 0x7FFFFFFF cap. Flag/pos counters are read once and staged in r10 to avoid re-loading on every iteration. Errors bump MV_ST_ERRORS and populate mv_argv_error_flag_index for M2's diagnostic renderer. Labels prefixed mv_ap_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                          // align rsp % 16 for nested calls
+
+        mov r12, rdi;                        // argc
+        mov r13, rsi;                        // argv
+
+        // Bump MV_ST_INVOCATIONS unconditionally so the counter records
+        // every ATTEMPT, not every success (same discipline as
+        // shell/src/line_reader.pdx).
+        mov rdi, 0;                          // MV_ST_INVOCATIONS
+        call mv_note;
+
+        // Gate: argc non-zero.
+        cmp r12, 0;
+        je  mv_ap_bad_argc;
+
+        // Gate: argv non-null.
+        cmp r13, 0;
+        je  mv_ap_bad_argv;
+
+        // Reset both mv-side and libpdx-argv-side singletons.
+        call mv_argv_reset;
+        call reset;                          // ParsedArgs::reset
+
+        // Dispatch libpdx-argv Parser::parse_argv(argv, argc).
+        mov rdi, r13;                        // argv
+        mov rsi, r12;                        // argc
+        call parse_argv;                     // Parser::parse_argv
+
+        // parse_argv returned an ERR_* code -> MV_ARG_PARSE_ERR.
+        cmp rax, 0;
+        jne mv_ap_parse_err;
+
+        // Walk flag_names[0..flag_count]. r14 = k = 0.
+        xor r14, r14;
+
+      mv_ap_flag_loop:
+        lea r11, [rip + flag_count];
+        mov r10, [r11];
+        cmp r14, r10;
+        jge mv_ap_flags_done;
+
+        lea r11, [rip + flag_names];
+        mov r15, [r11 + r14*8];              // r15 = current flag name pointer
+
+        // Try "v": byte0 == 'v' (0x76), byte1 == NUL.
+        xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x76; jne mv_ap_try_i;
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    jne mv_ap_try_i;
+        // Match "v" -> mv_argv_verbose = 1.
+        mov rax, 1;
+        lea r11, [rip + mv_argv_verbose];
+        mov [r11], rax;
+        jmp mv_ap_flag_next;
+
+      mv_ap_try_i:
+        // Try "i": byte0 == 'i' (0x69), byte1 == NUL.
+        xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x69; jne mv_ap_try_dry_run;
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    jne mv_ap_try_dry_run;
+        // Match "i" -> mv_argv_interactive = 1.
+        mov rax, 1;
+        lea r11, [rip + mv_argv_interactive];
+        mov [r11], rax;
+        jmp mv_ap_flag_next;
+
+      mv_ap_try_dry_run:
+        // Try "dry-run": byte-by-byte "d","r","y","-","r","u","n",NUL.
+        xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x64; jne mv_ap_unknown_flag;  // 'd'
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0x72; jne mv_ap_unknown_flag;  // 'r'
+        xor rax, rax; mov_b rax, [r15 + 2]; cmp rax, 0x79; jne mv_ap_unknown_flag;  // 'y'
+        xor rax, rax; mov_b rax, [r15 + 3]; cmp rax, 0x2D; jne mv_ap_unknown_flag;  // '-'
+        xor rax, rax; mov_b rax, [r15 + 4]; cmp rax, 0x72; jne mv_ap_unknown_flag;  // 'r'
+        xor rax, rax; mov_b rax, [r15 + 5]; cmp rax, 0x75; jne mv_ap_unknown_flag;  // 'u'
+        xor rax, rax; mov_b rax, [r15 + 6]; cmp rax, 0x6E; jne mv_ap_unknown_flag;  // 'n'
+        xor rax, rax; mov_b rax, [r15 + 7]; cmp rax, 0;    jne mv_ap_unknown_flag;  // NUL
+        // Match "dry-run" -> mv_argv_dry_run = 1.
+        mov rax, 1;
+        lea r11, [rip + mv_argv_dry_run];
+        mov [r11], rax;
+        jmp mv_ap_flag_next;
+
+      mv_ap_flag_next:
+        add r14, 1;
+        jmp mv_ap_flag_loop;
+
+      mv_ap_flags_done:
+        // Check pos_count == 2 (M1 accepts exactly src + dst).
+        lea r11, [rip + pos_count];
+        mov r10, [r11];
+        cmp r10, 2;
+        jne mv_ap_too_few_pos;
+
+        // Copy pos_ptrs[0] -> mv_argv_src, pos_ptrs[1] -> mv_argv_dst.
+        lea r11, [rip + pos_ptrs];
+        mov rax, [r11 + 0];                  // pos[0]
+        lea r11, [rip + mv_argv_src];
+        mov [r11], rax;
+
+        lea r11, [rip + pos_ptrs];
+        mov rax, [r11 + 8];                  // pos[1]
+        lea r11, [rip + mv_argv_dst];
+        mov [r11], rax;
+
+        // Success.
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_ap_unknown_flag:
+        // Record the offending flag index for the M2 diagnostic renderer.
+        lea r11, [rip + mv_argv_error_flag_index];
+        mov [r11], r14;
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB14;                 // MV_ARG_UNKNOWN_FLAG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_ap_parse_err:
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB15;                 // MV_ARG_PARSE_ERR
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_ap_too_few_pos:
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB13;                 // MV_ARG_TOO_FEW_POS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_ap_bad_argc:
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB11;                 // MV_ARG_BAD_ARGC
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_ap_bad_argv:
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB12;                 // MV_ARG_BAD_ARGV
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
