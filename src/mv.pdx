@@ -139,6 +139,18 @@ module Mv = structure {
   pub let MV_MV_LINK_FAIL         : u64 = 0xFFFFEB36   // pdxfs_link refused inside TXN
   pub let MV_MV_COMMIT_FAIL       : u64 = 0xFFFFEB37   // pdxfs_txn_commit refused
 
+  // Move cross-device fallback (M2-002) codes (0xFFFFEB3[89ABCD]). Emitted
+  // by Move::move_cross_dev_body when the EXDEV path fails inside the
+  // outer TXN move_dispatch opened; the outer dispatcher preserves
+  // these across its pdxfs_txn_abort + mv_note calls via a .bss
+  // stash slot (mv_move_return_code).
+  pub let MV_MV_XDEV_OPEN_SRC_FAIL : u64 = 0xFFFFEB38   // sys_open(src, RD) failed
+  pub let MV_MV_XDEV_OPEN_DST_FAIL : u64 = 0xFFFFEB39   // sys_open(dst, WR|CR) failed
+  pub let MV_MV_XDEV_READ_FAIL     : u64 = 0xFFFFEB3A   // sys_read failed
+  pub let MV_MV_XDEV_WRITE_FAIL    : u64 = 0xFFFFEB3B   // sys_write failed
+  pub let MV_MV_XDEV_SHORT_WRITE   : u64 = 0xFFFFEB3C   // sys_write short (partial state)
+  pub let MV_MV_XDEV_UNLINK_FAIL   : u64 = 0xFFFFEB3D   // pdxfs_unlink refused inside TXN
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //

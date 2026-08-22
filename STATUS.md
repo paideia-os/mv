@@ -26,6 +26,20 @@ breakdown.
   parents differ. Error paths call pdxfs_txn_abort to unwind a
   mid-thread TXN and return a distinct MV_MV_* code from the
   0xFFFFEB3x band.
+- `src/move.pdx` (issue #5): Move::move_cross_dev_body — cp+rm
+  internal fallback for the EXDEV case. Byte-copies through a
+  4 KiB scratch (mv_move_xdev_buf) via real sys_open/read/write/
+  close; on EOF closes both fds and unlinks the source dirent
+  inside the OUTER TXN (still-single-TXN invariant). move_dispatch
+  detects EXDEV by `mov rcx, 0xFFFFFFFFFFFFFFEE; cmp rax, rcx`
+  and dispatches to the fallback; on success bumps MV_ST_CROSS_DEV
+  and joins the commit path; on failure preserves the specific
+  MV_MV_XDEV_* code across pdxfs_txn_abort via a .bss stash slot
+  (mv_move_return_code).
+- `src/pdxfs.pdx` (issue #5): Pdxfs::pdxfs_open / pdxfs_read /
+  pdxfs_write / pdxfs_close — four real sys_open/read/write/close
+  trampolines (matching cp's discipline) added for the fallback
+  path.
 
 ## M1 — design + skeleton (complete)
 
@@ -83,6 +97,12 @@ breakdown.
 | 0xFFFFEB35 | MV_MV_UNLINK_FAIL   | pdxfs_unlink refused inside TXN                |
 | 0xFFFFEB36 | MV_MV_LINK_FAIL     | pdxfs_link refused inside TXN                  |
 | 0xFFFFEB37 | MV_MV_COMMIT_FAIL   | pdxfs_txn_commit refused                       |
+| 0xFFFFEB38 | MV_MV_XDEV_OPEN_SRC_FAIL | cross-dev fallback: sys_open(src) failed  |
+| 0xFFFFEB39 | MV_MV_XDEV_OPEN_DST_FAIL | cross-dev fallback: sys_open(dst) failed  |
+| 0xFFFFEB3A | MV_MV_XDEV_READ_FAIL     | cross-dev fallback: sys_read failed       |
+| 0xFFFFEB3B | MV_MV_XDEV_WRITE_FAIL    | cross-dev fallback: sys_write failed      |
+| 0xFFFFEB3C | MV_MV_XDEV_SHORT_WRITE   | cross-dev fallback: short write           |
+| 0xFFFFEB3D | MV_MV_XDEV_UNLINK_FAIL   | cross-dev fallback: pdxfs_unlink refused  |
 
 ## Milestone rollup
 
@@ -92,7 +112,7 @@ breakdown.
 | M1-002 (#2)     | argv surface via libpdx-argv (mv [-v|-i|--dry-run])           | LANDED |
 | M1-003 (#3)     | first runnable: same-dir rename in single TXN                 | LANDED |
 | M2-001 (#4)     | cross-dir same-device move (link-unlink atomic in TXN)        | LANDED |
-| M2-002 (#5)     | cross-device move via cp+rm internal fallback                 | OPEN   |
+| M2-002 (#5)     | cross-device move via cp+rm internal fallback                 | LANDED |
 | M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | OPEN   |
 | M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | OPEN   |
 

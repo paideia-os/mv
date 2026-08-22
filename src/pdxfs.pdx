@@ -238,6 +238,95 @@ module Pdxfs = structure {
     }
 
   // ==========================================================================
+  // Regular-file I/O syscall numbers (mirror paideia-os
+  // src/kernel/core/syscall/dispatch.pdx L256-263). Used by mv M2-002
+  // for the cross-device byte-copy fallback (sys_read + sys_write
+  // through a scratch buffer). These are the same numbers cp M1 uses
+  // in its Pdxfs module and match the Linux-compatible sysno assignment
+  // (0 = read, 1 = write, 2 = open, 3 = close).
+  // ==========================================================================
+  pub let SYS_READ  : u64 = 0
+  pub let SYS_WRITE : u64 = 1
+  pub let SYS_OPEN  : u64 = 2
+  pub let SYS_CLOSE : u64 = 3
+
+  // O_* mirrors (mirror paideia-os src/kernel/core/fs/vfs_open.pdx L36-38)
+  pub let O_RDONLY : u64 = 0
+  pub let O_WRONLY : u64 = 1
+  pub let O_CREAT  : u64 = 0x40
+
+  // ==========================================================================
+  // pdxfs_open(path_ptr, flags) -> fd_or_errno
+  //
+  // Regular open trampoline for the cross-device fallback path. Same
+  // shape as cp's Pdxfs::pdxfs_open (mode arg forced to 0). Real
+  // syscall today; not stubbed -- sys_open is live at R14b bootstrap.
+  //
+  // RDI = path_ptr, RSI = flags. RAX = fd on success (>= 3);
+  // negative errno on failure.
+  // ==========================================================================
+  pub let pdxfs_open : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-002 (#5): pdxfs_open trampoline for the cross-device byte-copy fallback. Real syscall (sysno 2 = sys_open) -- landed at R14b bootstrap, no substrate wait needed. SysV arg1=rdi(path), arg2=rsi(flags); syscall wants arg1=rdi, arg2=rsi, arg3=rdx(mode). Arity 3 < 4 so no r10 shuffle. Mode set to 0 explicitly because caller does not supply it (paideia-os substrate ignores mode per sys_open.pdx L18). Return: fd on success in [3, 32), negative-errno u64 on failure. sysreg effect for the SYSRET rcx/r11 clobber. Leaf; matches cp's Pdxfs::pdxfs_open (paideia-os/cp src/pdxfs.pdx) verbatim.",
+      block: {
+        mov rdx, 0;                            // mode = 0 (ignored)
+        mov rax, 2;                            // SYSCALL_OPEN
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_read(fd, buf_ptr, len) -> bytes_or_errno
+  //
+  // Real sys_read (sysno 0). Return: bytes_read in [0, len] on
+  // success (0 == EOF); negative errno on failure.
+  // ==========================================================================
+  pub let pdxfs_read : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (fd: u64) (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-002 (#5): pdxfs_read trampoline. Real sys_read (sysno 0). Arity 3, no r10 shuffle. Return: bytes_read in [0, len] on success (0 == EOF loop-exit); negative errno on failure. Callers gate with `cmp rax, 0; jl err` for error and `je eof` for EOF. Leaf; sysreg for SYSRET clobber. Matches cp Pdxfs::pdxfs_read verbatim.",
+      block: {
+        mov rax, 0;                            // SYSCALL_READ
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_write(fd, buf_ptr, len) -> bytes_or_errno
+  //
+  // Real sys_write (sysno 1).
+  // ==========================================================================
+  pub let pdxfs_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (fd: u64) (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-002 (#5): pdxfs_write trampoline. Real sys_write (sysno 1). Arity 3. Return: bytes_written in [0, len] on success (short-write is legal non-error); negative errno on failure. Leaf; sysreg for SYSRET clobber.",
+      block: {
+        mov rax, 1;                            // SYSCALL_WRITE
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_close(fd) -> 0_or_errno
+  //
+  // Real sys_close (sysno 3).
+  // ==========================================================================
+  pub let pdxfs_close : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-002 (#5): pdxfs_close trampoline. Real sys_close (sysno 3). Arity 1. Return: 0 on success, negative errno on failure. Leaf; sysreg for SYSRET clobber. Callers ignore return in error paths -- the fd is released at task teardown regardless.",
+      block: {
+        mov rax, 3;                            // SYSCALL_CLOSE
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // pdxfs_device_of(inode_handle) -> device_id_or_errno
   //
   // Return the device id backing an inode. mv M2-002 uses this to

@@ -105,6 +105,36 @@ module Move = structure {
   pub let mut mv_move_src_inode    : u64 = uninit @align(8)
   pub let mut mv_move_txn_handle   : u64 = uninit @align(8)
 
+  // -- M2-002 cross-device fallback state -----------------------------------
+  //
+  // 4 KiB byte-copy scratch, running byte counter, two file descriptor
+  // slots. Same footprint as cp's CopyFile::copy_buf / bytes_copied /
+  // fd_src / fd_dst. 4 KiB matches the typical page-size fingerprint;
+  // amortises the syscall overhead for a small-file-typical workload
+  // without pinning excessive .bss.
+  pub let MV_XDEV_BUF_LEN : u64 = 4096
+  pub let mut mv_move_xdev_buf     : [u8; 4096] = uninit @align(8)
+  pub let mut mv_move_xdev_fd_src  : u64        = uninit @align(8)
+  pub let mut mv_move_xdev_fd_dst  : u64        = uninit @align(8)
+  pub let mut mv_move_xdev_bytes   : u64        = uninit @align(8)
+
+  // -- M2-002 was_cross_device flag ------------------------------------------
+  //
+  // Set to 1 by move_dispatch when the EXDEV fallback fires. The
+  // verbose diagnostic (M2-003) reads this to decide whether to emit
+  // the "not O(1)" advisory. Also written to a semantic-pipe record
+  // at M3 (MoveRecord.was_cross_device). Cleared in move_reset.
+  pub let mut mv_move_was_cross_device : u64 = uninit @align(8)
+
+  // -- Return-code stash slot -----------------------------------------------
+  //
+  // move_dispatch uses this to preserve the specific MV_MV_XDEV_*
+  // return code from move_cross_dev_body across the pdxfs_txn_abort
+  // + mv_note calls that follow a fallback failure (nested calls
+  // clobber rax). Cheaper + more legible than the push-rax + dummy-
+  // push-to-realign-rsp alternative.
+  pub let mut mv_move_return_code : u64 = uninit @align(8)
+
   // ==========================================================================
   // move_reset() -> ()
   //
@@ -115,15 +145,240 @@ module Move = structure {
   pub let move_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M2-001 (#4): zero the six move-local .bss slots so move_dispatch starts empty. Same idiom as mv_argv_reset (src/argv.pdx) and cp's CopyFile::copy_reset (paideia-os/cp src/copy.pdx). xor rax,rax; six lea+mov pairs. Leaf function -- no push/pop parity. r11 is scratch (paideia-as conformance).",
+      justification: "mv.M2-001 (#4) + mv.M2-002 (#5): zero the move-local .bss slots so move_dispatch starts empty. Same idiom as mv_argv_reset (src/argv.pdx) and cp's CopyFile::copy_reset (paideia-os/cp src/copy.pdx). xor rax,rax; ten lea+mov pairs (six M2-001 slots + four M2-002 slots including was_cross_device). Leaf function -- no push/pop parity. r11 is scratch (paideia-as conformance).",
       block: {
         xor rax, rax;
-        lea r11, [rip + mv_move_src_parent];   mov [r11], rax;
-        lea r11, [rip + mv_move_src_basename]; mov [r11], rax;
-        lea r11, [rip + mv_move_dst_parent];   mov [r11], rax;
-        lea r11, [rip + mv_move_dst_basename]; mov [r11], rax;
-        lea r11, [rip + mv_move_src_inode];    mov [r11], rax;
-        lea r11, [rip + mv_move_txn_handle];   mov [r11], rax;
+        lea r11, [rip + mv_move_src_parent];        mov [r11], rax;
+        lea r11, [rip + mv_move_src_basename];      mov [r11], rax;
+        lea r11, [rip + mv_move_dst_parent];        mov [r11], rax;
+        lea r11, [rip + mv_move_dst_basename];      mov [r11], rax;
+        lea r11, [rip + mv_move_src_inode];         mov [r11], rax;
+        lea r11, [rip + mv_move_txn_handle];        mov [r11], rax;
+        lea r11, [rip + mv_move_xdev_fd_src];       mov [r11], rax;
+        lea r11, [rip + mv_move_xdev_fd_dst];       mov [r11], rax;
+        lea r11, [rip + mv_move_xdev_bytes];        mov [r11], rax;
+        lea r11, [rip + mv_move_was_cross_device];  mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // move_cross_dev_body(src_ptr, dst_ptr) -> u64
+  //
+  // Cross-device byte-copy fallback for the M2-002 EXDEV case. Called
+  // BY move_dispatch after pdxfs_link returns PDXFS_ERR_EXDEV (-18)
+  // indicating that source inode and destination parent live on
+  // different devices. The move can still complete atomically because
+  // the outer TXN (opened by move_dispatch) buffers the destination-
+  // device write group + the source-device unlink into ONE WAL scope;
+  // pdxfs_txn_commit drains both device groups or neither.
+  //
+  // The txn handle, src_parent, and src_basename slots are read from
+  // the .bss slots move_dispatch already populated (mv_move_txn_handle,
+  // mv_move_src_parent, mv_move_src_basename) so this function's arity
+  // stays 2 (matches the M1 rename_same_dir arity for reader ergonomics).
+  //
+  // RDI (input): src_ptr -- NUL-terminated source path
+  // RSI (input): dst_ptr -- NUL-terminated destination path
+  // RAX (output): 0 on success; MV_MV_XDEV_* on any error.
+  //
+  // The R42 substrate landing will attach a TXN handle to sys_open so
+  // the read/write pair is buffered inside the same TXN scope. Until
+  // then the trampolines are plain sys_read / sys_write which is
+  // atomicity-equivalent for the single-device case tests exercise;
+  // the M4 fixture matrix documents the semantic gap.
+  //
+  // Sequence:
+  //   (1) pdxfs_open(src, O_RDONLY = 0)      -> fd_src.
+  //   (2) pdxfs_open(dst, O_WRONLY|O_CREAT = 0x41) -> fd_dst.
+  //   (3) Byte-copy loop through mv_move_xdev_buf until EOF (n == 0).
+  //       Accumulate bytes into mv_move_xdev_bytes.
+  //   (4) pdxfs_close(fd_dst); pdxfs_close(fd_src) (return codes ignored).
+  //   (5) pdxfs_unlink(txn, src_parent, src_basename) -- inside the
+  //       outer TXN. On failure the caller's abort unwinds the dst
+  //       inode as well (the WAL group is discarded).
+  //   (6) Return 0.
+  //
+  // Register plan (nested Pdxfs::* calls):
+  //   rbx = src_ptr
+  //   r12 = dst_ptr
+  //   r13 = fd_src (from pdxfs_open)
+  //   r14 = fd_dst (from pdxfs_open)
+  //   r15 = n (last read bytes; needed as write len and as short-write cmp)
+  //   rax = call return / accumulator scratch
+  //   rdi/rsi/rdx = SysV args to nested calls
+  //   r11 = LEA scratch (paideia-as reserved)
+  //
+  // Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15) = 40 bytes;
+  // odd-count push idiom lands rsp % 16 == 0 without needing a stack
+  // pad sub. Same idiom as cp CopyFile::copy_single_file and mv's own
+  // move_dispatch.
+  // ==========================================================================
+  pub let move_cross_dev_body : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mv.M2-002 (#5): move_cross_dev_body -- cp+rm internal fallback for the EXDEV case. Byte-copies through a 4 KiB scratch (mv_move_xdev_buf) via real sys_open/read/write/close (Pdxfs::pdxfs_open etc.); on EOF, closes both fds and unlinks the source dirent inside the outer TXN (via Pdxfs::pdxfs_unlink using the txn handle mv_move_txn_handle plus src_parent/src_basename already resolved by move_dispatch). Both the destination-device write group AND the source-device unlink are buffered in the ONE WAL scope move_dispatch opened; commit drains both or neither (still-single-TXN invariant from plan doc §5.7 M2 line). Prologue is 5 callee-save pushes (rbx=src_ptr, r12=dst_ptr, r13=fd_src, r14=fd_dst, r15=last_n) = 40 bytes; odd-count push lands rsp % 16 == 0 (same idiom as cp copy_single_file, mv move_dispatch). Six error branches (open_src / open_dst / read / write / short_write / unlink) each close whichever fds are open (0/1/2 depending on where the error hit) and return a distinct MV_MV_XDEV_* code from the 0xFFFFEB3[89ABCD] band. Short-write detected by `cmp rax, r15; jl` (signed compare -- rax = bytes_written from sys_write, r15 = requested len; jl fires when bytes_written < requested). Negative-errno detection uses `cmp rax, 0; jl` throughout. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 0x40, 0x41, 4096 all fit). Register plan documented above; r11 scratch for every .bss reach. Effects match move_dispatch: !{mem, sysreg} for the syscall clobber shape; @{cap} because the outer TXN cap was already minted by move_dispatch (this body only invokes it via pdxfs_unlink -- an @{cap} operation); @{sched} because the byte-copy syscalls may block on device I/O. Labels prefixed mv_mx_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = src_ptr
+        mov r12, rsi;                        // r12 = dst_ptr
+
+        // ---- Step 1: open src (O_RDONLY = 0) --------------------------------
+        mov rdi, rbx;                        // path
+        mov rsi, 0;                          // O_RDONLY
+        call pdxfs_open;
+        cmp rax, 0;
+        jl  mv_mx_open_src_fail;             // negative errno
+
+        mov r13, rax;                        // r13 = fd_src
+        lea r11, [rip + mv_move_xdev_fd_src];
+        mov [r11], rax;
+
+        // ---- Step 2: open dst (O_WRONLY | O_CREAT = 0x41) -------------------
+        mov rdi, r12;                        // path
+        mov rsi, 0x41;                       // O_WRONLY | O_CREAT
+        call pdxfs_open;
+        cmp rax, 0;
+        jl  mv_mx_open_dst_fail;             // negative errno
+
+        mov r14, rax;                        // r14 = fd_dst
+        lea r11, [rip + mv_move_xdev_fd_dst];
+        mov [r11], rax;
+
+        // ---- Step 3: read/write loop ---------------------------------------
+      mv_mx_loop:
+        mov rdi, r13;                        // fd_src
+        lea rsi, [rip + mv_move_xdev_buf];   // buf
+        mov rdx, 4096;                       // MV_XDEV_BUF_LEN
+        call pdxfs_read;
+
+        cmp rax, 0;
+        jl  mv_mx_read_fail;                 // negative errno
+        je  mv_mx_eof;                       // n == 0 -> EOF
+
+        mov r15, rax;                        // r15 = n (bytes read)
+
+        mov rdi, r14;                        // fd_dst
+        lea rsi, [rip + mv_move_xdev_buf];
+        mov rdx, r15;                        // len = n
+        call pdxfs_write;
+
+        cmp rax, 0;
+        jl  mv_mx_write_fail;                // negative errno
+
+        cmp rax, r15;
+        jl  mv_mx_short_write;               // bytes_written < n
+
+        // Accumulate mv_move_xdev_bytes += rax.
+        lea r11, [rip + mv_move_xdev_bytes];
+        mov rcx, [r11];
+        add rcx, rax;
+        mov [r11], rcx;
+
+        jmp mv_mx_loop;
+
+        // ---- Step 4+5: success arm (EOF, close both, unlink src) ------------
+      mv_mx_eof:
+        // Close dst first, then src. Ignore return codes.
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+
+        // Step 5: unlink src dirent inside the outer TXN.
+        lea r11, [rip + mv_move_txn_handle];
+        mov rdi, [r11];
+        lea r11, [rip + mv_move_src_parent];
+        mov rsi, [r11];
+        lea r11, [rip + mv_move_src_basename];
+        mov rdx, [r11];
+        call pdxfs_unlink;
+        cmp rax, 0;
+        jne mv_mx_unlink_fail;
+
+        xor rax, rax;                        // MV_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        // ---- Error branches (fds cleaned per-branch) ------------------------
+      mv_mx_open_src_fail:
+        mov rax, 0xFFFFEB38;                 // MV_MV_XDEV_OPEN_SRC_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_mx_open_dst_fail:
+        // fd_src is open; close it.
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB39;                 // MV_MV_XDEV_OPEN_DST_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_mx_read_fail:
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB3A;                 // MV_MV_XDEV_READ_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_mx_write_fail:
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB3B;                 // MV_MV_XDEV_WRITE_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_mx_short_write:
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB3C;                 // MV_MV_XDEV_SHORT_WRITE
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_mx_unlink_fail:
+        // fds already closed on the success arm; nothing to release.
+        mov rax, 0xFFFFEB3D;                 // MV_MV_XDEV_UNLINK_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }
@@ -248,8 +503,37 @@ module Move = structure {
         mov rcx, [r11];                      // src_inode
         call pdxfs_link;
         cmp rax, 0;
-        jne mv_md_link_fail;
+        je  mv_md_link_ok;                   // link succeeded, commit path
+        // link returned non-zero: is it EXDEV? (M2-002 fallback path)
+        // PDXFS_ERR_EXDEV = 0xFFFFFFFFFFFFFFEE (-18). Load into rcx
+        // via imm64 mov (paideia-as emits mov r64, imm64) because
+        // `cmp rax, imm` requires the immediate to fit in 32 bits
+        // and 0xFFFFFFFFFFFFFFEE does not.
+        mov rcx, 0xFFFFFFFFFFFFFFEE;
+        cmp rax, rcx;
+        jne mv_md_link_fail;                 // some other errno -> hard fail
 
+        // ---- Step 6b (M2-002): EXDEV -> byte-copy + unlink fallback ---------
+        // Mark the operation as cross-device for the M2-003 diagnostic
+        // BEFORE calling move_cross_dev_body so a body-side abort still
+        // records the flag (the flag is descriptive, not consequential).
+        mov rax, 1;
+        lea r11, [rip + mv_move_was_cross_device];
+        mov [r11], rax;
+
+        // move_cross_dev_body(src_ptr=rbx, dst_ptr=r12) uses the .bss
+        // slots move_dispatch populated (txn, src_parent, src_basename).
+        mov rdi, rbx;                        // src_ptr
+        mov rsi, r12;                        // dst_ptr
+        call move_cross_dev_body;
+        cmp rax, 0;
+        jne mv_md_xdev_fail;                 // fallback failed -> abort TXN
+
+        // Fallback succeeded -- bump MV_ST_CROSS_DEV and fall into commit.
+        mov rdi, 7;                          // MV_ST_CROSS_DEV
+        call mv_note;
+
+      mv_md_link_ok:
         // ---- Step 7: commit TXN ---------------------------------------------
         mov rdi, r15;                        // txn
         call pdxfs_txn_commit;
@@ -348,6 +632,28 @@ module Move = structure {
         mov rdi, 5;
         call mv_note;
         mov rax, 0xFFFFEB36;                 // MV_MV_LINK_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_md_xdev_fail:
+        // move_cross_dev_body returned a specific MV_MV_XDEV_* code in
+        // rax. Stash it in .bss so it survives the abort + note calls.
+        lea r11, [rip + mv_move_return_code];
+        mov [r11], rax;
+        // TXN has the dst-side writes (if any) threaded -- abort.
+        mov rdi, r15;
+        call pdxfs_txn_abort;
+        mov rdi, 4;                          // MV_ST_TXN_ABORTS
+        call mv_note;
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        // Restore the specific fallback error code.
+        lea r11, [rip + mv_move_return_code];
+        mov rax, [r11];
         pop r15;
         pop r14;
         pop r13;
