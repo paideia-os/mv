@@ -24,6 +24,22 @@ breakdown.
   emission satisfies D3 audit-first (the record is observable even
   if the commit fails mid-drain; the emitted txn_handle field lets
   a consumer correlate to PdxFS TXN state).
+- `src/audit.pdx` (issue #9): Audit module — svc_lookup +
+  ipc_send trampolines against R20b substrate sysno 43 / 42
+  (live at HEAD). `mv_audit_write_move` looks up the
+  "svc.audit-journal" endpoint (cached in mv_audit_endpoint on
+  first call) then sends the 80-byte MoveRecord as an IPC payload.
+  Return-code band 0xFFFFEB6x (MV_AUD_LOOKUP_FAIL /
+  MV_AUD_SEND_FAIL). Adds MV_ST_AUDIT_WRITES (slot 12).
+- `src/move.pdx` (issue #9): Move::move_dispatch calls
+  mv_audit_write_move AFTER schema emit and BEFORE
+  pdxfs_txn_commit. On failure branches to mv_md_audit_fail --
+  aborts the TXN via pdxfs_txn_abort (source dirent stays intact,
+  no destination artifact appears), bumps MV_ST_TXN_ABORTS +
+  MV_ST_ERRORS, and returns the specific MV_AUD_* code via the
+  mv_move_return_code stash slot (nested calls clobber rax). This
+  is the D3 audit-first gate: a mv that cannot log its own
+  operation is refused.
 
 ## M2 — core implementation (complete)
 
@@ -154,6 +170,9 @@ breakdown.
 | 0xFFFFEB50 | MV_SCH_STUB              | Schema.M3-001: reserved                    |
 | 0xFFFFEB51 | MV_SCH_EMIT_FAIL         | Schema.M3-001: pdxfs_write neg errno       |
 | 0xFFFFEB52 | MV_SCH_SHORT_WRITE       | Schema.M3-001: pdxfs_write short           |
+| 0xFFFFEB60 | MV_AUD_STUB              | Audit.M3-002: reserved                     |
+| 0xFFFFEB61 | MV_AUD_LOOKUP_FAIL       | Audit.M3-002: sys_svc_lookup neg errno     |
+| 0xFFFFEB62 | MV_AUD_SEND_FAIL         | Audit.M3-002: sys_ipc_send neg errno       |
 
 ## Milestone rollup
 
@@ -167,6 +186,7 @@ breakdown.
 | M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | LANDED |
 | M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | LANDED |
 | M3-001 (#8)     | MoveRecord[] schema bind (was_rename, was_cross_device flags) | LANDED |
+| M3-002 (#9)     | MoveRecord via libpdx-audit before commit                     | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

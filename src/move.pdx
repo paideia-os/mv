@@ -569,6 +569,18 @@ module Move = structure {
         call mv_schema_populate;
         call mv_schema_emit;
 
+        // ---- Step 6e (M3-002): audit journal write --------------------------
+        // Audit-first (D3): the audit write is a REAL gate. If the
+        // journal is full, the service is unreachable, or the caller
+        // lacks the ipc-invoke right, the mv operation is refused --
+        // a tool that can suppress its own audit trail is a category
+        // of attack the D3 upgrade forecloses (plan doc §4). On
+        // failure abort the TXN so the source dirent stays intact +
+        // no destination artifact appears.
+        call mv_audit_write_move;
+        cmp rax, 0;
+        jne mv_md_audit_fail;
+
         // ---- Step 7: commit TXN ---------------------------------------------
         mov rdi, r15;                        // txn
         call pdxfs_txn_commit;
@@ -713,6 +725,27 @@ module Move = structure {
         call mv_note;
         mov rax, 0xFFFFEB37;                 // MV_MV_COMMIT_FAIL
         add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_md_audit_fail:
+        // M3-002 audit-first refuse -- stash the specific MV_AUD_*
+        // code across the abort + note calls (nested calls clobber
+        // rax), then abort the TXN so the source dirent stays intact.
+        lea r11, [rip + mv_move_return_code];
+        mov [r11], rax;
+        mov rdi, r15;                        // txn
+        call pdxfs_txn_abort;
+        mov rdi, 4;                          // MV_ST_TXN_ABORTS
+        call mv_note;
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        lea r11, [rip + mv_move_return_code];
+        mov rax, [r11];                      // restore MV_AUD_*
         pop r15;
         pop r14;
         pop r13;

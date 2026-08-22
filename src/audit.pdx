@@ -1,0 +1,258 @@
+// src/audit.pdx -- mv.M3-002 (paideia-os/mv#9)
+//
+// Audit module: MoveRecord journal write via libpdx-audit before commit.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M3-002 is the plan doc §5.7 M3 line's second landing:
+//
+//   "MoveRecord via libpdx-audit before commit."
+//
+// Every successful mv writes its MoveRecord (populated by
+// Schema::mv_schema_populate at M3-001) into the system-wide audit
+// journal BEFORE pdxfs_txn_commit runs. The audit-first discipline
+// (D3) means: if the audit write fails, the mv operation is
+// refused; a tool that can suppress its own audit trail is a
+// category of attack the D3 upgrade forecloses (plan doc §4).
+//
+// The audit journal is a supervisor service reached over IPC:
+//
+//   sys_svc_lookup("svc.audit-journal", len) -> KIND_IPC_ENDPOINT slot
+//   sys_ipc_send(slot, hdr, payload_va, payload_len)
+//
+// Both syscalls are LIVE at HEAD (R20b substrate; sysno 42 =
+// sys_ipc_send, sysno 43 = sys_svc_lookup -- see paideia-os
+// src/kernel/core/syscall/dispatch.pdx). The M3-002 body wires
+// them; there is no substrate wait.
+//
+// This module owns:
+//
+//   * Two trampolines for the R20b IPC syscalls (sys_ipc_send,
+//     sys_svc_lookup). They mirror the shape shell's exec module
+//     uses for its own IPC (paideia-os/shell src/exec.pdx) but
+//     redeclare the constants here to keep the mv crate self-
+//     contained -- no libpdx-audit dependency at M3-002 (the crate
+//     is scheduled at R50 but not yet in-tree).
+//   * A .bss slot for the audit-journal endpoint handle
+//     (mv_audit_endpoint), populated on first mv_audit_write_move
+//     call and reused for the invocation's lifetime.
+//   * A 20-byte NUL-terminated svc name literal
+//     ("svc.audit-journal\0\0\0", 17-char + 3-pad).
+//   * mv_audit_write_move() -> u64 -- the main entry point.
+//     Looks up the endpoint if needed, then dispatches sys_ipc_send
+//     with the MoveRecord payload.
+//
+// The M3-003 undo hook and M3-004 elevate hook consume the same
+// endpoint slot in the general case (multiple audit records per
+// mv), so the lookup-once-cache-once discipline keeps the sys_svc_
+// lookup work off the hot commit path.
+//
+// =============================================================================
+// SEQUENCE
+// =============================================================================
+//
+// mv_audit_write_move() -> u64
+//
+//   1. If mv_audit_endpoint == 0, call sys_svc_lookup to populate it.
+//      Failure -> MV_AUD_LOOKUP_FAIL.
+//   2. Call sys_ipc_send(mv_audit_endpoint, 0, mv_move_record, 80).
+//      Failure -> MV_AUD_SEND_FAIL.
+//   3. Bump MV_ST_AUDIT_WRITES (slot 12).
+//   4. Return 0.
+//
+// mv_audit_write_move is called from Move::move_dispatch AFTER
+// mv_schema_populate (which fills the record) and BEFORE
+// pdxfs_txn_commit. A failure at step 2 causes the caller to
+// abort the TXN (mv_md_audit_fail branch): the source dirent
+// stays intact and no destination artifact appears.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Audit`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears).
+//   - Byte reads not used (svc name is passed by pointer + length to
+//     sys_svc_lookup; no per-byte loop in mv-side asm).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - Trampolines are LEAF functions. mv_audit_write_move preserves
+//     no callee-save state itself (two nested SysV calls; matched
+//     `sub rsp, 8` / `add rsp, 8` for alignment).
+
+module Audit = structure {
+
+  // ==========================================================================
+  // R20b IPC syscall numbers (mirror paideia-os
+  // src/kernel/core/syscall/dispatch.pdx L308-318). Live at HEAD.
+  //
+  //   42 sys_ipc_send   (cap_slot, hdr_va, payload_va, payload_len)
+  //   43 sys_svc_lookup (user_name_va, name_len) -> cap_slot_or_errno
+  // ==========================================================================
+  pub let SYS_IPC_SEND    : u64 = 42
+  pub let SYS_SVC_LOOKUP  : u64 = 43
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEB6x (Audit layer)
+  //
+  //   0xFFFFEB60 MV_AUD_STUB          reserved / unused at M3-002
+  //   0xFFFFEB61 MV_AUD_LOOKUP_FAIL   sys_svc_lookup returned negative errno
+  //   0xFFFFEB62 MV_AUD_SEND_FAIL     sys_ipc_send returned negative errno
+  // ==========================================================================
+  pub let MV_AUD_STUB         : u64 = 0xFFFFEB60
+  pub let MV_AUD_LOOKUP_FAIL  : u64 = 0xFFFFEB61
+  pub let MV_AUD_SEND_FAIL    : u64 = 0xFFFFEB62
+
+  // ==========================================================================
+  // Cached audit-journal endpoint handle
+  //
+  // 0 = not-yet-looked-up (first call to mv_audit_write_move fills it).
+  // >0 = KIND_IPC_ENDPOINT slot from sys_svc_lookup. Reused for the
+  // whole invocation; a fresh mv process re-does the lookup at exec
+  // time (no cross-process cache).
+  // ==========================================================================
+  pub let mut mv_audit_endpoint : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // svc name literal
+  //
+  // "svc.audit-journal\0\0\0" -- 20 bytes, 17-char name + 3-pad NUL to
+  // keep the buffer u64-aligned. sys_svc_lookup ignores anything past
+  // the length arg, so the padding is inert. Same discipline as
+  // libpdx-argv's flag-name literals.
+  // ==========================================================================
+  pub let SVC_AUDIT_JOURNAL_NAME     : [u8; 20] = "svc.audit-journal\0\0\0"
+  pub let SVC_AUDIT_JOURNAL_NAME_LEN : u64 = 17
+
+  // ==========================================================================
+  // svc_lookup(name_va, name_len) -> cap_slot_or_errno
+  //
+  // Real R20b syscall (sysno 43) -- landed. Arity 2, no r10 shuffle.
+  // Leaf; sysreg for SYSRET clobber.
+  //
+  // RDI = user_name_va, RSI = name_len.
+  // RAX = KIND_IPC_ENDPOINT slot (>=0) on success, negative errno on
+  //       failure. Success reserves a fresh slot in the caller's
+  //       cap_table (see paideia-os
+  //       src/kernel/core/syscall/handlers/sys_svc_lookup.pdx).
+  // ==========================================================================
+  pub let svc_lookup : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (name_va: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mv.M3-002 (#9): svc_lookup trampoline. Real R20b syscall (sysno 43 = SYS_SVC_LOOKUP -- see paideia-os src/kernel/core/syscall/dispatch.pdx L318). Arity 2 (name_va, name_len), no r10 shuffle needed. Return: KIND_IPC_ENDPOINT cap_slot >= 0 on success (fresh slot minted in caller's cap_table), negative errno on failure (SYS_SVC_LOOKUP_ERR_ENOENT = -2 if the name is unbound; SYS_SVC_LOOKUP_ERR_EINVAL = -22 if name_len is nonsense). @{cap} because success mints a new capability into the caller's cap_table. Leaf; sysreg for SYSRET rcx/r11 clobber.",
+      block: {
+        mov rax, 43;                             // SYS_SVC_LOOKUP
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ipc_send(cap_slot, hdr_va, payload_va, payload_len) -> 0_or_errno
+  //
+  // Real R20b syscall (sysno 42) -- landed. Arity 4; SysV rcx maps
+  // to syscall r10.
+  //
+  // RDI = cap_slot (KIND_IPC_ENDPOINT slot from svc_lookup).
+  // RSI = hdr_va (0 = no header at M3-002; the audit journal reads
+  //       schema id from the payload's leading MOVE_RECORD_MAGIC).
+  // RDX = payload_va (pointer to mv_move_record).
+  // RCX = payload_len (80 = MV_MOVE_RECORD_SIZE).
+  // RAX = 0 on success, negative errno on failure (SYS_IPC_SEND_ERR_
+  //       BAD_ID = -3 if slot is stale; SYS_IPC_SEND_ERR_PAYLOAD_LEN
+  //       = -4 if len > kernel MAX; SYS_IPC_SEND_ERR_CHANDEAD = -104
+  //       if the audit journal service is unreachable).
+  // ==========================================================================
+  pub let ipc_send : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cap_slot: u64) (hdr_va: u64) (payload_va: u64) (payload_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mv.M3-002 (#9): ipc_send trampoline. Real R20b syscall (sysno 42 = SYS_IPC_SEND -- see paideia-os src/kernel/core/syscall/dispatch.pdx L308). Arity 4 requires the SysV-rcx-to-syscall-r10 shuffle. Return: 0 on success, negative errno on failure (SYS_IPC_SEND_ERR_BAD_ID = -3 if the cap_slot is stale, SYS_IPC_SEND_ERR_PAYLOAD_LEN = -4 if len exceeds the kernel MAX, SYS_IPC_SEND_ERR_CHANDEAD = -104 if the audit-journal service is unreachable). @{cap} because sys_ipc_send consumes the KIND_IPC_ENDPOINT cap identified by cap_slot. Leaf; sysreg for SYSRET rcx/r11 clobber. Same shape as shell's exec-time IPC send (paideia-os/shell src/exec.pdx).",
+      block: {
+        mov r10, rcx;                            // SysV rcx -> syscall r10
+        mov rax, 42;                             // SYS_IPC_SEND
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_audit_write_move() -> u64
+  //
+  // Look up the audit journal endpoint if needed, then send the
+  // MoveRecord (populated by Schema::mv_schema_populate at M3-001)
+  // as an IPC payload. Called from Move::move_dispatch AFTER
+  // mv_schema_emit and BEFORE pdxfs_txn_commit.
+  //
+  // Return:
+  //   0                   on success (record queued in the journal)
+  //   MV_AUD_LOOKUP_FAIL  sys_svc_lookup refused the audit-journal name
+  //   MV_AUD_SEND_FAIL    sys_ipc_send refused (bad slot / dead chan / etc.)
+  //
+  // Bumps MV_ST_AUDIT_WRITES (slot 12) on success; MV_ST_ERRORS on
+  // any failure.
+  //
+  // No inputs. Two nested SysV calls (svc_lookup, ipc_send). Prologue
+  // `sub rsp, 8` to align rsp % 16 == 0 for the calls. r11 scratch.
+  // ==========================================================================
+  pub let mv_audit_write_move : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mv.M3-002 (#9): mv_audit_write_move -- audit-first journal write for the MoveRecord. Two nested SysV calls (svc_lookup on first-call cold path; ipc_send always). Cold-cache miss on mv_audit_endpoint (== 0) triggers svc_lookup with the SVC_AUDIT_JOURNAL_NAME literal + length 17; success caches the returned cap_slot into mv_audit_endpoint. Then ipc_send(slot, 0, mv_move_record, 80). Prologue is `sub rsp, 8` for rsp % 16 == 0 alignment across the nested calls (entry rsp % 16 == 8; sub 8 -> 0; matches libpdx-elevate elevate_client_lookup_broker idiom). `cmp rax, 0; jl fail` catches negative errno for both calls. On success bumps MV_ST_AUDIT_WRITES (slot 12); on any failure bumps MV_ST_ERRORS (slot 5). @{cap} because svc_lookup mints a new KIND_IPC_ENDPOINT cap and ipc_send consumes it. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears). Labels prefixed mv_aw_.",
+      block: {
+        sub rsp, 8;                              // align rsp % 16 == 0 for nested calls
+
+        // ---- Cold-cache: look up the audit-journal endpoint -----------------
+        lea r11, [rip + mv_audit_endpoint];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mv_aw_have_slot;                     // already cached
+
+        // Lookup: svc_lookup(SVC_AUDIT_JOURNAL_NAME, SVC_AUDIT_JOURNAL_NAME_LEN).
+        lea rdi, [rip + SVC_AUDIT_JOURNAL_NAME];
+        mov rsi, 17;                             // SVC_AUDIT_JOURNAL_NAME_LEN
+        call svc_lookup;
+
+        cmp rax, 0;
+        jl  mv_aw_lookup_fail;                   // negative errno
+
+        // Cache the slot.
+        lea r11, [rip + mv_audit_endpoint];
+        mov [r11], rax;
+
+      mv_aw_have_slot:
+        // ---- Hot path: send the MoveRecord ----------------------------------
+        lea r11, [rip + mv_audit_endpoint];
+        mov rdi, [r11];                          // cap_slot
+        mov rsi, 0;                              // hdr_va (none at M3-002)
+        lea rdx, [rip + mv_move_record];         // payload_va
+        mov rcx, 80;                             // payload_len (MV_MOVE_RECORD_SIZE)
+        call ipc_send;
+
+        cmp rax, 0;
+        jl  mv_aw_send_fail;                     // negative errno
+
+        // ---- Success --------------------------------------------------------
+        mov rdi, 12;                             // MV_ST_AUDIT_WRITES
+        call mv_note;
+        xor rax, rax;                            // MV_OK
+        add rsp, 8;
+        ret;
+
+      mv_aw_lookup_fail:
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB61;                     // MV_AUD_LOOKUP_FAIL
+        add rsp, 8;
+        ret;
+
+      mv_aw_send_fail:
+        mov rdi, 5;                              // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB62;                     // MV_AUD_SEND_FAIL
+        add rsp, 8;
+        ret
+      }
+    }
+}

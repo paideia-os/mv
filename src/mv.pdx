@@ -164,6 +164,14 @@ module Mv = structure {
   pub let MV_SCH_EMIT_FAIL         : u64 = 0xFFFFEB51   // pdxfs_write returned negative errno
   pub let MV_SCH_SHORT_WRITE       : u64 = 0xFFFFEB52   // pdxfs_write returned < MV_MOVE_RECORD_SIZE
 
+  // Audit (M3-002) codes (0xFFFFEB6x). MoveRecord audit-journal
+  // write failures. Bodies live in src/audit.pdx (module Audit).
+  // Audit-first (D3): a failure at this stage aborts the TXN --
+  // an mv that cannot log its own operation is refused.
+  pub let MV_AUD_STUB              : u64 = 0xFFFFEB60   // reserved
+  pub let MV_AUD_LOOKUP_FAIL       : u64 = 0xFFFFEB61   // sys_svc_lookup neg errno
+  pub let MV_AUD_SEND_FAIL         : u64 = 0xFFFFEB62   // sys_ipc_send neg errno
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
@@ -187,7 +195,8 @@ module Mv = structure {
   //   9 MV_ST_INODE_PRESERVED   (M2-004) signed-inode preserve successes
   //  10 MV_ST_INODE_REKEYED     (M2-004) signed-inode re-sign successes
   //  11 MV_ST_RECORDS_EMITTED   (M3-001) Schema::mv_schema_emit successes
-  //  12..15 reserved             for M3-002..M3-004
+  //  12 MV_ST_AUDIT_WRITES      (M3-002) Audit::mv_audit_write_move successes
+  //  13..15 reserved             for M3-003..M3-004
   //
   // Cache-line alignment matches _shell_stats / _elevate_broker_stats
   // -- keeps a future SMP counter path a mechanical widening rather
@@ -208,6 +217,7 @@ module Mv = structure {
   pub let MV_ST_INODE_PRESERVED  : u64 = 9
   pub let MV_ST_INODE_REKEYED    : u64 = 10
   pub let MV_ST_RECORDS_EMITTED  : u64 = 11
+  pub let MV_ST_AUDIT_WRITES     : u64 = 12
   pub let MV_ST_MAX              : u64 = 16
 
   // ==========================================================================
