@@ -548,9 +548,15 @@ module Move = structure {
 
         // Bump MV_ST_CROSS_DIR if src_parent != dst_parent.
         cmp r13, r14;
-        je  mv_md_success;
+        je  mv_md_verbose;
         mov rdi, 6;                          // MV_ST_CROSS_DIR
         call mv_note;
+
+      mv_md_verbose:
+        // M2-003: emit --verbose diagnostic if flag was set + xdev fired.
+        // Best-effort: mv_verbose_diag returns 0 unconditionally and
+        // its internal fd-2 write failure does not affect rax here.
+        call mv_verbose_diag;
 
       mv_md_success:
         xor rax, rax;                        // MV_OK

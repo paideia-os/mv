@@ -1,0 +1,125 @@
+// src/verbose.pdx -- mv.M2-003 (paideia-os/mv#6)
+//
+// Verbose module: --verbose diagnostic emission for mv.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv M2-003 is the plan doc §5.7 M2 line's third landing:
+//
+//   "cross-device move (degrades to cp+rm internally, still single TXN
+//    with a diagnostic that operation is not O(1))"
+//
+// The advisory is emitted on stderr (fd 2) IFF two conditions hold:
+//
+//   (1) mv_argv_verbose == 1 (the caller passed `-v`).
+//   (2) mv_move_was_cross_device == 1 (Move::move_dispatch set this
+//       when its pdxfs_link returned PDXFS_ERR_EXDEV and it fell into
+//       the cp+rm byte-copy path).
+//
+// Rendered format:
+//
+//   "mv: crossed device (cp+rm fallback, not O(1))\n"
+//
+// Placement: called from Move::move_dispatch on the success arm,
+// after MV_ST_CROSS_DEV bumps but before the epilogue. The caller
+// pattern is a bare `call mv_verbose_diag` -- no arguments, no
+// return-value check (the diagnostic is best-effort; a fd-2 write
+// refusal does not invalidate the mv operation itself).
+//
+// =============================================================================
+// FUTURE EXTENSIONS
+// =============================================================================
+//
+// M2-004 will add a second condition (mv_move_was_cross_user == 1)
+// which emits a parallel advisory:
+//
+//   "mv: crossed user (inode re-signed under invoker)\n"
+//
+// M3 will replace both hand-rolled strings with libpdx-audit /
+// libpdx-semantic-pipe record emissions carrying structured fields
+// (was_cross_device: bool, was_cross_user: bool) instead of prose.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Verbose`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (largest is the
+//     message length, well under 0x7FFFFFFF).
+//   - Byte reads not used (message is a byte array passed by
+//     pointer + length to sys_write).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - mv_verbose_diag is a single-call function to pdxfs_write.
+//     Prologue: no callee-save needed (rax/rdi/rsi/rdx are all
+//     caller-save; no state to preserve across the syscall).
+//     rsp % 16 == 8 on entry stays 8 until the call; the call
+//     pushes 8 giving rsp % 16 == 0 at pdxfs_write's entry, which
+//     is what SysV wants.
+//     Wait -- that's WRONG. SysV wants rsp % 16 == 0 BEFORE the
+//     call so the callee sees rsp % 16 == 8 on entry. We have
+//     rsp % 16 == 8 on entry to mv_verbose_diag; a bare call
+//     without a stack adjustment would give the nested pdxfs_write
+//     entry rsp % 16 == 0 -- which callees can handle but is
+//     off-standard. Safer: `sub rsp, 8` on entry, `add rsp, 8`
+//     before ret.
+
+module Verbose = structure {
+
+  // ==========================================================================
+  // Diagnostic strings
+  //
+  // Kept short so a scripted mv's stderr stays scannable. The M3 audit
+  // record replaces both with schema-typed field emissions.
+  // ==========================================================================
+  pub let MV_VERBOSE_XDEV_MSG : [u8; 46] =
+    "mv: crossed device (cp+rm fallback, not O(1))\n"
+  pub let MV_VERBOSE_XDEV_MSG_LEN : u64 = 46
+
+  // ==========================================================================
+  // mv_verbose_diag() -> u64
+  //
+  // Emit the --verbose diagnostic to stderr (fd 2) IFF
+  // MvArgv::mv_argv_verbose == 1 AND Move::mv_move_was_cross_device == 1.
+  //
+  // Returns 0 always -- the diagnostic is best-effort; a fd-2 write
+  // refusal does not invalidate the mv operation itself.
+  //
+  // No inputs. No callee-save needed. `sub rsp, 8` on entry keeps
+  // rsp % 16 == 0 for the nested pdxfs_write call (entry rsp % 16
+  // == 8 + sub 8 = 0). Matching `add rsp, 8` before ret.
+  // ==========================================================================
+  pub let mv_verbose_diag : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-003 (#6): mv_verbose_diag. Gate 1: MvArgv::mv_argv_verbose == 1 (via `lea r11, [rip+mv_argv_verbose]; mov rax, [r11]; cmp rax, 0; je out`). Gate 2: Move::mv_move_was_cross_device == 1 (same idiom). If both pass, call pdxfs_write(fd=2, MV_VERBOSE_XDEV_MSG, MV_VERBOSE_XDEV_MSG_LEN) via `mov rdi, 2; lea rsi, [rip+MV_VERBOSE_XDEV_MSG]; mov rdx, 46; call pdxfs_write`. Return 0 unconditionally -- the diagnostic is best-effort per D3 audit-first: the mv operation itself succeeded (Move set the flag AFTER committing), so a fd-2 write refusal does not invalidate that. Return-value ignored. Stack alignment: entry rsp % 16 == 8; `sub rsp, 8` on entry brings it to 0 for the nested pdxfs_write; `add rsp, 8` before ret. Same idiom as libpdx-elevate's small single-call helpers. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0 and 2 both fit). r11 scratch for .bss reaches. Labels prefixed mv_vd_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 == 0 for pdxfs_write
+
+        // Gate 1: --verbose flag.
+        lea r11, [rip + mv_argv_verbose];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mv_vd_out;
+
+        // Gate 2: was_cross_device flag.
+        lea r11, [rip + mv_move_was_cross_device];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mv_vd_out;
+
+        // Emit "mv: crossed device (cp+rm fallback, not O(1))\n" on fd 2.
+        mov rdi, 2;                          // stderr
+        lea rsi, [rip + MV_VERBOSE_XDEV_MSG];
+        mov rdx, 46;                         // MV_VERBOSE_XDEV_MSG_LEN
+        call pdxfs_write;
+
+      mv_vd_out:
+        xor rax, rax;                        // return 0 always
+        add rsp, 8;
+        ret
+      }
+    }
+}

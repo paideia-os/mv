@@ -40,6 +40,13 @@ breakdown.
   pdxfs_write / pdxfs_close — four real sys_open/read/write/close
   trampolines (matching cp's discipline) added for the fallback
   path.
+- `src/verbose.pdx` (issue #6): Verbose module — `mv_verbose_diag`
+  reads MvArgv::mv_argv_verbose + Move::mv_move_was_cross_device
+  and prints "mv: crossed device (cp+rm fallback, not O(1))\n" to
+  stderr (fd 2) when both flags are set. Called from Move::
+  move_dispatch's success arm as a best-effort emission (the
+  operation is already committed; a fd-2 write refusal does not
+  invalidate mv's return code).
 
 ## M1 — design + skeleton (complete)
 
@@ -113,7 +120,7 @@ breakdown.
 | M1-003 (#3)     | first runnable: same-dir rename in single TXN                 | LANDED |
 | M2-001 (#4)     | cross-dir same-device move (link-unlink atomic in TXN)        | LANDED |
 | M2-002 (#5)     | cross-device move via cp+rm internal fallback                 | LANDED |
-| M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | OPEN   |
+| M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | LANDED |
 | M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | OPEN   |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
