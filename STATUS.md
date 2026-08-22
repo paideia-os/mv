@@ -1,10 +1,31 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M1 (design + skeleton) — complete
+**Current milestone:** M2 (core implementation) — in progress
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
+
+## M2 — core implementation (in progress)
+
+- `src/pdxfs.pdx` (issue #4): Pdxfs module — eight userspace
+  syscall trampolines for the PdxFS v1 txn substrate
+  (pdxfs_txn_open / pdxfs_txn_commit / pdxfs_txn_abort /
+  pdxfs_unlink / pdxfs_link / pdxfs_resolve_parent /
+  pdxfs_inode_of / pdxfs_device_of). All bodies are M2 stubs
+  returning 0 (or 1 for handle-valued returns) pending the R42
+  substrate landing of sys_pdxfs_* dispatch entries; each is a
+  straight `mov rax, SYSNO; syscall; ret` body-edit away from
+  R42.
+- `src/move.pdx` (issue #4): Move module — `move_dispatch(src,
+  dst)` threads pdxfs_resolve_parent x 2 + pdxfs_inode_of +
+  pdxfs_txn_open + pdxfs_unlink + pdxfs_link +
+  pdxfs_txn_commit under one TXN, handling BOTH same-directory
+  rename (src_parent == dst_parent) AND cross-directory move
+  (src_parent != dst_parent). Bumps MV_ST_CROSS_DIR when the
+  parents differ. Error paths call pdxfs_txn_abort to unwind a
+  mid-thread TXN and return a distinct MV_MV_* code from the
+  0xFFFFEB3x band.
 
 ## M1 — design + skeleton (complete)
 
@@ -54,6 +75,14 @@ breakdown.
 | 0xFFFFEB24 | MV_RN_UNLINK_FAIL   | M2+: sys_pdxfs_unlink refused inside TXN       |
 | 0xFFFFEB25 | MV_RN_LINK_FAIL     | M2+: sys_pdxfs_link refused inside TXN         |
 | 0xFFFFEB26 | MV_RN_COMMIT_FAIL   | M2+: sys_pdxfs_txn_commit refused              |
+| 0xFFFFEB30 | MV_MV_STUB          | reserved                                        |
+| 0xFFFFEB31 | MV_MV_RESOLVE_SRC_FAIL | pdxfs_resolve_parent(src) failed             |
+| 0xFFFFEB32 | MV_MV_RESOLVE_DST_FAIL | pdxfs_resolve_parent(dst) failed             |
+| 0xFFFFEB33 | MV_MV_INODE_FAIL    | pdxfs_inode_of(src) failed                     |
+| 0xFFFFEB34 | MV_MV_TXN_OPEN_FAIL | pdxfs_txn_open refused                         |
+| 0xFFFFEB35 | MV_MV_UNLINK_FAIL   | pdxfs_unlink refused inside TXN                |
+| 0xFFFFEB36 | MV_MV_LINK_FAIL     | pdxfs_link refused inside TXN                  |
+| 0xFFFFEB37 | MV_MV_COMMIT_FAIL   | pdxfs_txn_commit refused                       |
 
 ## Milestone rollup
 
@@ -62,6 +91,10 @@ breakdown.
 | M1-001 (#1)     | scaffold + caps.decl (src-parent + dst-parent write + TXN)    | LANDED |
 | M1-002 (#2)     | argv surface via libpdx-argv (mv [-v|-i|--dry-run])           | LANDED |
 | M1-003 (#3)     | first runnable: same-dir rename in single TXN                 | LANDED |
+| M2-001 (#4)     | cross-dir same-device move (link-unlink atomic in TXN)        | LANDED |
+| M2-002 (#5)     | cross-device move via cp+rm internal fallback                 | OPEN   |
+| M2-003 (#6)     | was_cross_device diagnostic on --verbose                      | OPEN   |
+| M2-004 (#7)     | signed-inode preservation + cross-user graceful degrade       | OPEN   |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

@@ -126,31 +126,62 @@ module Mv = structure {
   pub let MV_RN_LINK_FAIL       : u64 = 0xFFFFEB25   // M2+: sys_pdxfs_link refused
   pub let MV_RN_COMMIT_FAIL     : u64 = 0xFFFFEB26   // M2+: sys_pdxfs_txn_commit refused
 
+  // Move (M2-001) stubs and errors (0xFFFFEB3x). The Move module
+  // in src/move.pdx handles both the same-directory rename case
+  // (src_parent == dst_parent) and the cross-directory move case
+  // (src_parent != dst_parent) inside one PdxFS TXN.
+  pub let MV_MV_STUB              : u64 = 0xFFFFEB30   // reserved
+  pub let MV_MV_RESOLVE_SRC_FAIL  : u64 = 0xFFFFEB31   // pdxfs_resolve_parent(src) failed
+  pub let MV_MV_RESOLVE_DST_FAIL  : u64 = 0xFFFFEB32   // pdxfs_resolve_parent(dst) failed
+  pub let MV_MV_INODE_FAIL        : u64 = 0xFFFFEB33   // pdxfs_inode_of(src) failed
+  pub let MV_MV_TXN_OPEN_FAIL     : u64 = 0xFFFFEB34   // pdxfs_txn_open refused
+  pub let MV_MV_UNLINK_FAIL       : u64 = 0xFFFFEB35   // pdxfs_unlink refused inside TXN
+  pub let MV_MV_LINK_FAIL         : u64 = 0xFFFFEB36   // pdxfs_link refused inside TXN
+  pub let MV_MV_COMMIT_FAIL       : u64 = 0xFFFFEB37   // pdxfs_txn_commit refused
+
   // ==========================================================================
-  // Session-level stats -- eight u64 slots, cache-line aligned.
+  // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
-  // Slot map (M1):
-  //   0 MV_ST_INVOCATIONS  mv_argv_parse / rename_same_dir entries
-  //   1 MV_ST_RENAMES      successful same-dir renames (M2+)
-  //   2 MV_ST_TXN_OPENS    sys_pdxfs_txn_open calls (M2+); would-open at M1
-  //   3 MV_ST_TXN_COMMITS  sys_pdxfs_txn_commit successes (M2+)
-  //   4 MV_ST_TXN_ABORTS   sys_pdxfs_txn_commit failures (M2+)
-  //   5 MV_ST_ERRORS       any error / reject path from any mv module
-  //   6..7 reserved         for M2 (cross-dir, cross-device)
+  // M2 widened the table from 8 to 16 slots to make room for the
+  // cross-dir / cross-device / cross-user counters M2-001..M2-004
+  // add (slots 6..10). Slots 11..15 stay reserved for M3 (semantic-
+  // pipe record counts, undo-record write counts).
+  //
+  // Slot map:
+  //   0 MV_ST_INVOCATIONS       mv_argv_parse / move_dispatch / rename entries
+  //   1 MV_ST_RENAMES           successful same-dir renames == MV_ST_MOVES alias
+  //                              (M2 bump: Move::move_dispatch bumps this on
+  //                               every successful commit, same-dir OR cross-dir)
+  //   2 MV_ST_TXN_OPENS         pdxfs_txn_open successes
+  //   3 MV_ST_TXN_COMMITS       pdxfs_txn_commit successes
+  //   4 MV_ST_TXN_ABORTS        pdxfs_txn_commit failures / user-side aborts
+  //   5 MV_ST_ERRORS            any error / reject path from any mv module
+  //   6 MV_ST_CROSS_DIR         (M2-001) src_parent != dst_parent commits
+  //   7 MV_ST_CROSS_DEV         (M2-002) cross-device fallback commits
+  //   8 MV_ST_CROSS_USER        (M2-004) cross-user graceful degrade count
+  //   9 MV_ST_INODE_PRESERVED   (M2-004) signed-inode preserve successes
+  //  10 MV_ST_INODE_REKEYED     (M2-004) signed-inode re-sign successes
+  //  11..15 reserved             for M3
   //
   // Cache-line alignment matches _shell_stats / _elevate_broker_stats
   // -- keeps a future SMP counter path a mechanical widening rather
   // than a re-layout.
   // ==========================================================================
-  pub let mut _mv_stats : [u64; 8] = uninit @align(64)
+  pub let mut _mv_stats : [u64; 16] = uninit @align(64)
 
-  pub let MV_ST_INVOCATIONS : u64 = 0
-  pub let MV_ST_RENAMES     : u64 = 1
-  pub let MV_ST_TXN_OPENS   : u64 = 2
-  pub let MV_ST_TXN_COMMITS : u64 = 3
-  pub let MV_ST_TXN_ABORTS  : u64 = 4
-  pub let MV_ST_ERRORS      : u64 = 5
-  pub let MV_ST_MAX         : u64 = 8
+  pub let MV_ST_INVOCATIONS      : u64 = 0
+  pub let MV_ST_RENAMES          : u64 = 1
+  pub let MV_ST_MOVES            : u64 = 1        // alias for cross-dir case
+  pub let MV_ST_TXN_OPENS        : u64 = 2
+  pub let MV_ST_TXN_COMMITS      : u64 = 3
+  pub let MV_ST_TXN_ABORTS       : u64 = 4
+  pub let MV_ST_ERRORS           : u64 = 5
+  pub let MV_ST_CROSS_DIR        : u64 = 6
+  pub let MV_ST_CROSS_DEV        : u64 = 7
+  pub let MV_ST_CROSS_USER       : u64 = 8
+  pub let MV_ST_INODE_PRESERVED  : u64 = 9
+  pub let MV_ST_INODE_REKEYED    : u64 = 10
+  pub let MV_ST_MAX              : u64 = 16
 
   // ==========================================================================
   // mv_reset() -> ()
@@ -169,7 +200,7 @@ module Mv = structure {
   pub let mv_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M1-001 (#1): clear the eight-word session stats table. Startup + teardown only; a live counter reset would race any concurrent mv_note (same discipline as shell_reset shell/src/shell.pdx, elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70). Loop: r10 base, rcx index 0..8, rax = 0. `cmp rcx, 8` uses imm <= 0x7FFFFFFF (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed mv_rs_.",
+      justification: "mv.M1-001 (#1) + mv.M2-001 (#4): clear the sixteen-word session stats table (M2 widened from 8 to 16 slots to fit cross-dir/cross-dev/cross-user + signed-inode counters). Startup + teardown only; a live counter reset would race any concurrent mv_note (same discipline as shell_reset shell/src/shell.pdx, elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70). Loop: r10 base, rcx index 0..16, rax = 0. `cmp rcx, 16` uses imm <= 0x7FFFFFFF (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed mv_rs_.",
       block: {
         lea r10, [rip + _mv_stats];
         xor rax, rax;
@@ -177,7 +208,7 @@ module Mv = structure {
       mv_rs_loop:
         mov [r10 + rcx * 8], rax;
         add rcx, 1;
-        cmp rcx, 8;
+        cmp rcx, 16;
         jb  mv_rs_loop;
         ret
       }
@@ -199,9 +230,9 @@ module Mv = structure {
   pub let mv_note : (u64) -> () !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M1-001 (#1): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as shell_note (shell/src/shell.pdx) and elevate_client_note (libpdx-elevate/src/elevate_client.pdx). `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed mv_nt_.",
+      justification: "mv.M1-001 (#1) + mv.M2-001 (#4): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as shell_note (shell/src/shell.pdx) and elevate_client_note (libpdx-elevate/src/elevate_client.pdx). M2 widened the bound from 8 to 16 to track the extra cross-dir/cross-dev/cross-user/signed-inode counters. `cmp rdi, 16` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed mv_nt_.",
       block: {
-        cmp rdi, 8;
+        cmp rdi, 16;
         jae mv_nt_out;
         lea r10, [rip + _mv_stats];
         mov rax, [r10 + rdi * 8];
@@ -227,9 +258,9 @@ module Mv = structure {
   pub let mv_stat : (u64) -> u64 !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M1-001 (#1): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as shell_stat (shell/src/shell.pdx) and elevate_client_stat (libpdx-elevate/src/elevate_client.pdx). `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed mv_st_.",
+      justification: "mv.M1-001 (#1) + mv.M2-001 (#4): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as shell_stat (shell/src/shell.pdx) and elevate_client_stat (libpdx-elevate/src/elevate_client.pdx). M2 widened the bound from 8 to 16. `cmp rdi, 16` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed mv_st_.",
       block: {
-        cmp rdi, 8;
+        cmp rdi, 16;
         jae mv_st_zero;
         lea r10, [rip + _mv_stats];
         mov rax, [r10 + rdi * 8];

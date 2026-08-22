@@ -1,0 +1,259 @@
+// src/pdxfs.pdx -- mv.M2-001 (paideia-os/mv#4)
+//
+// Pdxfs module: userspace syscall trampolines for the PdxFS v1 txn
+// substrate. mv uses six of them at M2-001 (txn_open, txn_commit,
+// txn_abort, resolve_parent, unlink, link, inode_of, device_of).
+// M2-002 adds four more (open/read/write/close) for the cross-device
+// byte-copy fallback; M2-004 adds two (inode_owner, inode_rebind_owner)
+// for the signed-inode preservation path.
+//
+// =============================================================================
+// SCOPE + SUBSTRATE STATE
+// =============================================================================
+//
+// Every trampoline is a straight-line `mov rax, SYSNO; syscall; ret`
+// with the SysV argument-in-place-for-syscall convention (arity <= 3;
+// no r10 shuffle needed). This matches cp's Pdxfs module discipline
+// (paideia-os/cp src/pdxfs.pdx) and libpdx-audit's syscall_shim
+// (libpdx-audit src/syscall_shim.pdx).
+//
+// The PdxFS v1 kernel substrate through R42 landed the KIND ordinal
+// rows (KIND_PDXFS_FILE = 0x195 at paideia-os
+// src/kernel/core/cap/kind_pdxfs_file.pdx; KIND_PDXFS_TXN = 0x196 at
+// kind_pdxfs_txn.pdx). The userspace-side sys_pdxfs_* syscall
+// wrappers are scheduled at R42 substrate expansion but not yet
+// exposed at HEAD (2026-08-21). Every trampoline body here is
+// therefore a STUB that returns 0 (PDXFS_OK) unconditionally --
+// callers thread the shape today and the R42 substrate landing is a
+// body-edit inside this module, no restructure at the call sites.
+//
+// This is the same pattern cp uses for its pdxfs_txn_begin / commit
+// stubs. When R42 lands the real sys_pdxfs_* dispatch entries, the
+// M2 upgrade here is `mov rax, SYSNO; syscall; ret` in place of
+// `xor rax, rax; ret`.
+//
+// =============================================================================
+// SYSCALL NUMBER ASSIGNMENT
+// =============================================================================
+//
+// The kernel-side dispatch table (paideia-os
+// src/kernel/core/syscall/dispatch.pdx L256-263 reserved band 512-527
+// for PdxFS v1 syscalls -- documented in the R42 substrate design at
+// paideia-os design/kernel/pdxfs-v1.md). mv mirrors those numbers here
+// so the trampoline bodies are one-line edits when the substrate
+// lands. Discrepancy between these mirrors and the authoritative
+// dispatch table is caught by the M4 smoke matrix.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Pdxfs`).
+//   - No `test` mnemonic; no zero-checks needed in leaf trampolines.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. No compares here.
+//   - Byte reads not used (trampolines forward u64 args verbatim).
+//   - r11 is scratch; unused in leaves.
+//   - All trampolines are LEAF functions -- no push/pop parity to
+//     preserve. rsp % 16 == 8 on entry stays 8 through the syscall
+//     itself; the kernel dispatch aligns internally.
+
+module Pdxfs = structure {
+
+  // ==========================================================================
+  // PdxFS v1 syscall numbers (mirror paideia-os R42 substrate reserved
+  // band at src/kernel/core/syscall/dispatch.pdx). The kernel dispatch
+  // will bind these to their handler bodies when R42 lands; today the
+  // trampolines below never issue a real syscall (stubs return 0).
+  // ==========================================================================
+  pub let SYS_PDXFS_TXN_OPEN       : u64 = 512
+  pub let SYS_PDXFS_TXN_COMMIT     : u64 = 513
+  pub let SYS_PDXFS_TXN_ABORT      : u64 = 514
+  pub let SYS_PDXFS_UNLINK         : u64 = 515
+  pub let SYS_PDXFS_LINK           : u64 = 516
+  pub let SYS_PDXFS_RESOLVE_PARENT : u64 = 517
+  pub let SYS_PDXFS_INODE_OF       : u64 = 518
+  pub let SYS_PDXFS_DEVICE_OF      : u64 = 519
+
+  // ==========================================================================
+  // PdxFS TXN mode ordinals (mirror kind_pdxfs_txn.pdx L88).
+  // ==========================================================================
+  pub let PXT_MODE_MODIFY : u64 = 2
+
+  // ==========================================================================
+  // Success sentinel + error mirrors mv actually checks against.
+  //
+  // PDXFS_OK           = 0 -- generic success return.
+  // PDXFS_ERR_EXDEV    = -18 (as unsigned 0xFFFFFFFFFFFFFFEE) -- cross-
+  //                     device link refused. Matches the POSIX EXDEV
+  //                     value the kernel returns from vfs_link when
+  //                     src and dst are on different devices; mv M2-002
+  //                     uses this sentinel to decide when to fall back
+  //                     to the cp+rm path.
+  // ==========================================================================
+  pub let PDXFS_OK        : u64 = 0
+  pub let PDXFS_ERR_EXDEV : u64 = 0xFFFFFFFFFFFFFFEE
+
+  // ==========================================================================
+  // pdxfs_txn_open(mode, snap_gen) -> handle_or_errno
+  //
+  // RDI = mode (see PXT_MODE_*).
+  // RSI = snap_gen (0 for the current snapshot generation; the M2-001
+  //       body passes 0 always -- snap-gen-pinned txns are a later
+  //       milestone).
+  // RAX = KIND_PDXFS_TXN handle (>0) on success, negative errno on
+  //       failure. M2-001 STUB returns 1 so callers see a non-zero
+  //       "valid handle" they can pass to unlink/link/commit.
+  // ==========================================================================
+  pub let pdxfs_txn_open : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (mode: u64) (snap_gen: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_txn_open trampoline. M2 STUB body returns handle=1 unconditionally so callers pass a non-zero handle downstream (unlink/link/commit accept it verbatim; the check is `cmp rax, 0; jl` for negative errno, which 1 does not trigger). The R42 substrate landing swaps the body to `mov rax, 512; syscall; ret` -- SysV arg1=rdi(mode), arg2=rsi(snap_gen); syscall wants same shape (arity 2, no r10 shuffle). Leaf; no callee-save touched. sysreg effect declared for the future syscall clobber shape (rcx, r11 per x86_64 SYSRET convention); the M2 stub body does not issue a syscall but the effect is declared for shape stability across the R42 body-edit.",
+      block: {
+        mov rax, 1;                            // STUB: valid non-zero handle
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_commit(handle) -> 0_or_errno
+  //
+  // RDI = txn handle from pdxfs_txn_open.
+  // RAX = 0 on success, negative errno on failure. M2-001 STUB returns 0.
+  // ==========================================================================
+  pub let pdxfs_txn_commit : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_txn_commit trampoline. M2 STUB returns 0 (success). R42 body: `mov rax, 513; syscall; ret`. Arity 1 -- no register shuffle. Leaf; sysreg effect declared for the future syscall clobber shape.",
+      block: {
+        xor rax, rax;                          // STUB: PDXFS_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_abort(handle) -> 0_or_errno
+  //
+  // Same shape as commit; used by mv's error paths to unwind a
+  // partially-threaded TXN. M2-001 STUB returns 0.
+  // ==========================================================================
+  pub let pdxfs_txn_abort : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_txn_abort trampoline. M2 STUB returns 0. R42 body: `mov rax, 514; syscall; ret`. Leaf; sysreg for future syscall clobber. Called by mv's error paths to unwind a mid-thread TXN (unlink succeeded but link failed, or link succeeded but commit failed etc.); the kernel's WAL group is discarded so no state change is observable.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_unlink(handle, parent_inode, basename_ptr) -> 0_or_errno
+  //
+  // Remove a dirent from `parent_inode` named by the NUL-terminated
+  // string at `basename_ptr`. The write is buffered in the TXN's WAL
+  // group and becomes durable only after pdxfs_txn_commit succeeds.
+  // M2-001 STUB returns 0.
+  // ==========================================================================
+  pub let pdxfs_unlink : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (handle: u64) (parent_inode: u64) (basename_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_unlink trampoline. M2 STUB returns 0. R42 body: `mov rax, 515; syscall; ret`. Arity 3, no r10 shuffle. The write is buffered inside the TXN's WAL group; abort discards it, commit makes it durable. Leaf; sysreg for future syscall clobber.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_link(handle, parent_inode, basename_ptr, inode_handle) -> 0_or_errno
+  //
+  // Add a dirent to `parent_inode` named by the NUL-terminated string
+  // at `basename_ptr`, pointing at `inode_handle`. Arity 4 -- SysV
+  // rcx maps to syscall r10 (the ABI shim). M2-001 STUB returns 0.
+  //
+  // Cross-device refusal (mv M2-002): if `parent_inode` and
+  // `inode_handle` are on different devices, the kernel returns
+  // PDXFS_ERR_EXDEV (-18). mv M2-002 checks for that sentinel and
+  // falls back to the byte-copy path.
+  // ==========================================================================
+  pub let pdxfs_link : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (handle: u64) (parent_inode: u64) (basename_ptr: u64) (inode_handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_link trampoline. M2 STUB returns 0. R42 body: `mov r10, rcx; mov rax, 516; syscall; ret` -- arity 4 requires the SysV-rcx-to-syscall-r10 shuffle. The kernel's vfs_link refuses cross-device with PDXFS_ERR_EXDEV (-18); mv M2-002 checks for that sentinel and falls back to a cp+rm byte-copy. Leaf w.r.t. callee-saves. sysreg for future syscall clobber. Argument shape mirrors the POSIX linkat conventions the R42 substrate design at paideia-os design/kernel/pdxfs-v1.md documents.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_resolve_parent(path_ptr, out_parent_inode_ptr, out_basename_ptr)
+  //   -> 0_or_errno
+  //
+  // Split a NUL-terminated path into (parent inode handle, basename
+  // pointer). Writes the parent inode to *out_parent_inode_ptr and
+  // the basename pointer to *out_basename_ptr on success. Returns 0
+  // on success, negative errno on failure.
+  //
+  // The basename pointer points into the caller's path string
+  // (position of the last slash + 1); no allocation. Caller must
+  // keep the path string alive until the caller no longer needs the
+  // basename pointer.
+  //
+  // M2-001 STUB writes parent_inode=1, basename_ptr=path_ptr and
+  // returns 0. The R42 substrate landing swaps the body to a real
+  // resolve dispatch.
+  // ==========================================================================
+  pub let pdxfs_resolve_parent : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) (out_parent_inode_ptr: u64) (out_basename_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_resolve_parent trampoline. M2 STUB writes parent_inode=1 to *out_parent_inode_ptr and basename_ptr=path_ptr to *out_basename_ptr so callers who read those slots after the call see valid non-zero values (mv's Move module gates on rax==0 for success). The R42 substrate landing swaps the body to `mov rax, 517; syscall; ret` (arity 3, no r10 shuffle). Leaf; sysreg for future syscall clobber. Writing back through rsi/rdx pointer args uses direct `mov [rsi], rax` (no r11 LEA needed because rsi/rdx already hold the output pointers). rax is used for both the immediate constant we write and the return value; the write happens first, then rax gets zeroed for the return.",
+      block: {
+        // Write stub values through the two output pointers.
+        // *out_parent_inode_ptr = 1 (STUB: a non-zero inode handle).
+        mov rax, 1;
+        mov [rsi], rax;
+        // *out_basename_ptr = path_ptr (STUB: whole path acts as basename).
+        mov [rdx], rdi;
+        // Return PDXFS_OK.
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_inode_of(path_ptr) -> inode_or_errno
+  //
+  // Resolve a NUL-terminated path to its inode handle. Non-zero on
+  // success; negative errno on failure. M2-001 STUB returns 1.
+  // ==========================================================================
+  pub let pdxfs_inode_of : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_inode_of trampoline. M2 STUB returns 1 (non-zero valid inode handle) so callers see a value they can pass to pdxfs_link. R42 body: `mov rax, 518; syscall; ret`. Arity 1, no shuffle. Leaf; sysreg for future syscall clobber.",
+      block: {
+        mov rax, 1;                            // STUB: valid non-zero handle
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_device_of(inode_handle) -> device_id_or_errno
+  //
+  // Return the device id backing an inode. mv M2-002 uses this to
+  // detect the cross-device case UP FRONT (rather than waiting for
+  // pdxfs_link to refuse with EXDEV) -- an early-detect path emits
+  // the was_cross_device diagnostic before touching the TXN.
+  //
+  // M2-001 STUB returns 1 (all inodes on device 1).
+  // ==========================================================================
+  pub let pdxfs_device_of : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (inode_handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.M2-001 (#4): pdxfs_device_of trampoline. M2 STUB returns 1 (single-device world) so a same-device check `cmp src_dev, dst_dev; je same_device` always takes the same-device branch at M2. R42 body: `mov rax, 519; syscall; ret`. Arity 1. Leaf; sysreg for future syscall clobber.",
+      block: {
+        mov rax, 1;                            // STUB: single device
+        ret
+      }
+    }
+}
