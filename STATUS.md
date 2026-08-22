@@ -1,12 +1,12 @@
 # mv — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M1 (design + skeleton) — in progress
+**Current milestone:** M1 (design + skeleton) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.7 in paideia-os for the full
 breakdown.
 
-## M1 — design + skeleton
+## M1 — design + skeleton (complete)
 
 - `src/mv.pdx` (issue #1): top-level `Mv` module — KIND ordinal
   mirrors (MV_KIND_USER / MV_KIND_IPC_ENDPOINT / MV_KIND_PDXFS_FILE /
@@ -25,7 +25,16 @@ breakdown.
   positional counts with `MV_ARG_TOO_FEW_POS`. Stores parsed results
   in mv-owned .bss slots (mv_argv_src / mv_argv_dst /
   mv_argv_verbose / mv_argv_interactive / mv_argv_dry_run).
-- `src/rename.pdx` (issue #3): PENDING.
+- `src/rename.pdx` (issue #3): `Rename` module — the same-directory
+  rename skeleton. `rename_same_dir(src, dst)` gates the args and
+  returns `MV_RN_STUB` (0xFFFFEB20) on the happy path; `MV_RN_BAD_SRC`
+  / `MV_RN_BAD_DST` on reject. Bumps `MV_ST_INVOCATIONS` /
+  `MV_ST_TXN_OPENS` / `MV_ST_ERRORS`. M2 replaces the MV_RN_STUB tail
+  with the real sys_pdxfs_txn_open + sys_pdxfs_unlink +
+  sys_pdxfs_link + sys_pdxfs_txn_commit dispatch.
+- `tests/README.md`: placeholder describing the M4 fixture matrix
+  (same-dir rename, cross-dir/cross-dev/cross-user, TXN-abort, undo
+  replay).
 
 ## Return-code band 0xFFFFEBxx
 
@@ -52,7 +61,7 @@ breakdown.
 |-----------------|---------------------------------------------------------------|--------|
 | M1-001 (#1)     | scaffold + caps.decl (src-parent + dst-parent write + TXN)    | LANDED |
 | M1-002 (#2)     | argv surface via libpdx-argv (mv [-v|-i|--dry-run])           | LANDED |
-| M1-003 (#3)     | first runnable: same-dir rename in single TXN                 | OPEN   |
+| M1-003 (#3)     | first runnable: same-dir rename in single TXN                 | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

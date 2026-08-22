@@ -1,0 +1,187 @@
+// src/rename.pdx -- mv.M1-003 (paideia-os/mv#3)
+//
+// Rename module: same-directory rename in a single PdxFS TXN (skeleton).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv's core operation for the M1 shape: `mv <src> <dst>` where src and
+// dst share a parent directory. The design (design/tooling/r49-r50-
+// plan.md §5.7 M1 line):
+//
+//   First runnable: same-directory rename `mv a b` opens TXN, unlinks
+//   source, links dest, commits.
+//
+// At full ripeness (M2) this is the sequence:
+//
+//   (1) sys_pdxfs_txn_open(mode=PXT_MODE_MODIFY, snap_gen=<cur>)
+//         → fresh KIND_PDXFS_TXN slot in caller's cap_table.
+//   (2) sys_pdxfs_unlink(txn, parent, src_basename)
+//         → source dirent removed inside TXN (not durable until commit).
+//   (3) sys_pdxfs_link(txn, parent, dst_basename, src_inode)
+//         → destination dirent added inside SAME TXN, pointing at the
+//           inode the unlink just released from its old name.
+//   (4) sys_pdxfs_txn_commit(txn)
+//         → drain WAL group; both writes durable atomically.
+//   (5) if -v: print "mv <src> <dst>" to KIND_TTY(write).
+//       if --dry-run: skip steps 1..4 entirely, print the same line.
+//   (6) return 0.
+//
+// M1 ships the SKELETON. It ships the entry-point signature, the
+// argument-gating (src/dst non-null), and the counter dispatch so mv's
+// stats table records every invocation / would-open the way the M2
+// body will. On the happy path it returns MV_RN_STUB (0xFFFFEB20) --
+// the "we validated the args, we would open a TXN and thread an
+// unlink + link through it if the userspace sys_pdxfs_* wrappers
+// existed, but they don't yet" signal.
+//
+// =============================================================================
+// WHY STUB IS THE HAPPY PATH AT M1
+// =============================================================================
+//
+// PdxFS v1 is scheduled at R42 in the paideia-os release table.
+// KIND_PDXFS_FILE (0x195) + KIND_PDXFS_TXN (0x196) have landed as
+// substrate rows (paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx,
+// kind_pdxfs_txn.pdx) -- the kernel can already mint / revoke / query
+// these caps. But the USERSPACE-side syscall wrappers
+// (sys_pdxfs_txn_open, sys_pdxfs_unlink, sys_pdxfs_link,
+// sys_pdxfs_txn_commit) are not yet linked into a mv-facing library.
+// They are being staged by the R42 substrate wave; at HEAD (2026-08-21)
+// mv cannot call them without linking against a symbol that does not
+// yet exist.
+//
+// Faking a rename at M1 would either:
+//
+//   (a) Mutate the caller's argv strings (defeating mv-is-a-tool -- the
+//       caller's argv is not mv's memory), or
+//   (b) Manufacture an outcome mv did not actually observe (defeating
+//       D3 audit-first at M3, when the audit hook goes live: a mv
+//       that "renamed" without touching the FS lies to its own audit
+//       journal).
+//
+// Neither is defensible. The skeleton stops one step short of the
+// substrate boundary and returns MV_RN_STUB. This mirrors the shell
+// LR_STUB / EX_STUB idiom (shell/src/line_reader.pdx, shell/src/
+// exec.pdx) and libpdx-elevate's ELVC_STUB (libpdx-elevate/src/
+// elevate_client.pdx).
+//
+// M2 replaces the MV_RN_STUB tail with the actual sys_pdxfs_txn_open
+// + sys_pdxfs_unlink + sys_pdxfs_link + sys_pdxfs_txn_commit dispatch.
+// Every consumer already spells rename_same_dir correctly; the M2
+// change is a body edit, not a signature change.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Rename`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares are
+//     `cmp r12, 0` (src non-null) and `cmp r13, 0` (dst non-null).
+//   - r11 is scratch; not used in M1 (no .bss reach from this module).
+//   - No byte reads in M1; the `xor rax, rax; mov_b rax, [ptr]`
+//     pattern shows up at M2 for dirent-name reads.
+//   - SysV push/pop parity preserved. Two callee-save pushes (r12 =
+//     src, r13 = dst) + one `sub rsp, 8` for alignment across the
+//     three nested mv_note calls; matched `add rsp, 8` before pop.
+//     Same idiom as shell/src/exec.pdx exec_spawn_and_wait and
+//     libpdx-elevate elevate_client_lookup_broker.
+
+module Rename = structure {
+
+  // ==========================================================================
+  // rename_same_dir(src, dst) -> u64
+  //
+  // Signature: rename_same_dir : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): src -- pointer to NUL-terminated source path (caller-owned)
+  // RSI (input): dst -- pointer to NUL-terminated destination path (caller-owned)
+  // RAX (output): 0 on success at M2+, MV_RN_STUB on the M1 happy path,
+  //               or one of the MV_RN_* codes on error.
+  //
+  // M1 semantics (skeleton):
+  //   src == 0             -> MV_RN_BAD_SRC
+  //   dst == 0             -> MV_RN_BAD_DST
+  //   otherwise            -> MV_RN_STUB
+  //
+  // Counter dispatch:
+  //   Every entry bumps MV_ST_INVOCATIONS.
+  //   The would-open happy path bumps MV_ST_TXN_OPENS (so the counter
+  //   records the intent to open a TXN even at M1; M2 keeps the same
+  //   bump semantics and additionally bumps MV_ST_TXN_COMMITS on a
+  //   successful commit).
+  //   Any reject path bumps MV_ST_ERRORS.
+  //
+  // Register plan:
+  //   r12 = src         (callee-save; preserved through mv_note calls)
+  //   r13 = dst         (callee-save; preserved through mv_note calls)
+  //   rdi = which       (bumped between calls)
+  //   rax = return value
+  //
+  // Prologue: two callee-save pushes + `sub rsp, 8` = 24 bytes. Entry
+  // rsp % 16 == 8, so 8 - 24 % 16 == 0. Post-prologue rsp % 16 == 0
+  // for the nested mv_note calls (SysV alignment). Matched epilogue.
+  // ==========================================================================
+  pub let rename_same_dir : (u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64) (dst: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.M1-003 (#3): the same-directory rename skeleton. Two callee-save pushes (r12=src, r13=dst) preserve the args across the nested mv_note calls at INVOCATIONS / TXN_OPENS / ERRORS so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the nested SysV call, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx) and the shell exec_spawn_and_wait skeleton (shell/src/exec.pdx). The src == 0 / dst == 0 gates use `cmp reg, 0` (paideia-as no-test-mnemonic discipline; imm 0 fits imm32 window). MV_RN_STUB (0xFFFFEB20) is the M1 happy-path sentinel -- the userspace sys_pdxfs_txn_open / sys_pdxfs_unlink / sys_pdxfs_link / sys_pdxfs_txn_commit wrappers are not yet in the tree (R42 substrate wave in progress; KIND_PDXFS_FILE/TXN rows land at paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx and kind_pdxfs_txn.pdx). Manufacturing a rename we did not actually perform would defeat the D3 audit-first invariant M3 formalises (see design/architecture.md §4.2). M2 replaces the MV_RN_STUB tail with the real sys_pdxfs_* dispatch; the return-code transitions from 0xFFFFEB20 -> 0 on the happy path. Labels prefixed mv_rn_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                          // align rsp % 16 for mv_note
+
+        mov r12, rdi;                        // src
+        mov r13, rsi;                        // dst
+
+        // Bump MV_ST_INVOCATIONS unconditionally so the counter records
+        // every ATTEMPT, not every success -- the failed-arg case is
+        // still an invocation the shell wants to see in its stats.
+        // (Same discipline as shell/src/line_reader.pdx's SH_ST_PROMPTS
+        // bump.)
+        mov rdi, 0;                          // MV_ST_INVOCATIONS
+        call mv_note;
+
+        // Gate: src non-null.
+        cmp r12, 0;
+        je  mv_rn_bad_src;
+
+        // Gate: dst non-null.
+        cmp r13, 0;
+        je  mv_rn_bad_dst;
+
+        // Would-open the TXN. Bump MV_ST_TXN_OPENS so the counter
+        // records the intent even at M1; M2 keeps the same bump when
+        // the sys_pdxfs_txn_open call actually issues.
+        mov rdi, 2;                          // MV_ST_TXN_OPENS
+        call mv_note;
+
+        // M1 happy path: MV_RN_STUB. M2 replaces this tail with the
+        // real sys_pdxfs_txn_open + sys_pdxfs_unlink + sys_pdxfs_link
+        // + sys_pdxfs_txn_commit dispatch and returns 0 on success.
+        mov rax, 0xFFFFEB20;                 // MV_RN_STUB
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_rn_bad_src:
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB21;                 // MV_RN_BAD_SRC
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_rn_bad_dst:
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB22;                 // MV_RN_BAD_DST
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
