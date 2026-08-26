@@ -77,10 +77,15 @@
 //     opaque u64; basename byte compare happens in pdxfs_resolve_parent
 //     inside the kernel).
 //   - SysV push/pop parity: move_dispatch saves rbx, r12, r13, r14, r15
-//     across the eight nested Pdxfs::* calls. Prologue is 5 pushes +
-//     `sub rsp, 8` for alignment; matching epilogue restores rsp %
-//     16 == 8 for the ret. Same idiom as cp's copy_single_file
-//     (paideia-os/cp src/copy.pdx).
+//     across the eight nested Pdxfs::* calls. Prologue is 5 pushes,
+//     no `sub rsp, N` -- entry rsp % 16 == 8 and 5 pushes lands
+//     rsp % 16 == 0, the odd-count alignment idiom. Matching epilogue
+//     is exactly 5 pops, no `add rsp, N`. Same idiom as cp's
+//     copy_single_file (paideia-os/cp src/copy.pdx). mv.ENH-001
+//     (paideia-os/mv#17): a stray `add rsp, 8` in the commit-fail
+//     epilogue broke this parity by one slot, corrupting the ret
+//     target and four callee-saves the instant pdxfs_txn_commit
+//     stops being a stub -- fixed by deleting the adjustment.
 
 module Move = structure {
 
@@ -425,7 +430,7 @@ module Move = structure {
   pub let move_dispatch : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "mv.M2-001 (#4): move_dispatch general-mv entry point. Threads unlink+link through a single Pdxfs TXN so both dirent writes land atomically (D3 audit-first, I5 undo -- half-completed moves are the class of bug PdxFS v1 exists to eliminate). Prologue is 5 callee-save pushes (rbx=src_ptr, r12=dst_ptr, r13=src_parent, r14=dst_parent, r15=txn_handle) = 40 bytes; entry rsp % 16 == 8 + 5 pushes lands rsp % 16 == 0 without needing a stack-pad sub (odd-count push idiom same as cp's copy_single_file; contrast M1 rename_same_dir which uses the even-count 2-push + sub 8 idiom). Eight nested Pdxfs::* SysV calls (resolve x2, inode_of, txn_open, unlink, link, txn_commit, and possibly txn_abort on error). Matching 5-pop epilogue restores rsp for the ret. Every zero/error compare uses `cmp reg, 0` (no test mnemonic; imm 0 fits imm32). Bump discipline: MV_ST_INVOCATIONS on entry, MV_ST_TXN_OPENS after txn_open success, MV_ST_TXN_COMMITS on commit success, MV_ST_TXN_ABORTS + MV_ST_ERRORS + explicit pdxfs_txn_abort on any post-open failure, MV_ST_MOVES on overall success, MV_ST_CROSS_DIR when src_parent != dst_parent. Every error path returns a distinct MV_MV_* code from the 0xFFFFEB3x band (STUB/RESOLVE_FAIL/INODE_FAIL/TXN_OPEN_FAIL/UNLINK_FAIL/LINK_FAIL/COMMIT_FAIL) so a downstream test identifies which stage failed. All Pdxfs::* trampolines are M2 stubs returning 0 (or 1 for handle-returning ones); the R42 substrate landing swaps their bodies without touching this dispatcher. Effects: !{mem, sysreg} for the syscall-clobber shape (mem via kernel WAL writes; sysreg via the syscall rcx/r11 clobber); @{cap} because pdxfs_txn_open mints a fresh KIND_PDXFS_TXN into the caller's cap_table; @{sched} because commit may block on the WAL drain group and the scheduler is entitled to preempt. Labels prefixed mv_md_.",
+      justification: "mv.M2-001 (#4): move_dispatch general-mv entry point. Threads unlink+link through a single Pdxfs TXN so both dirent writes land atomically (D3 audit-first, I5 undo -- half-completed moves are the class of bug PdxFS v1 exists to eliminate). Prologue is 5 callee-save pushes (rbx=src_ptr, r12=dst_ptr, r13=src_parent, r14=dst_parent, r15=txn_handle) = 40 bytes; entry rsp % 16 == 8 + 5 pushes lands rsp % 16 == 0 without needing a stack-pad sub (odd-count push idiom same as cp's copy_single_file; contrast M1 rename_same_dir which uses the even-count 2-push + sub 8 idiom). Eight nested Pdxfs::* SysV calls (resolve x2, inode_of, txn_open, unlink, link, txn_commit, and possibly txn_abort on error). Matching 5-pop epilogue restores rsp for the ret. Every zero/error compare uses `cmp reg, 0` (no test mnemonic; imm 0 fits imm32). Bump discipline: MV_ST_INVOCATIONS on entry, MV_ST_TXN_OPENS after txn_open success, MV_ST_TXN_COMMITS on commit success, MV_ST_TXN_ABORTS + MV_ST_ERRORS + explicit pdxfs_txn_abort on any post-open failure, MV_ST_MOVES on overall success, MV_ST_CROSS_DIR when src_parent != dst_parent. Every error path returns a distinct MV_MV_* code from the 0xFFFFEB3x band (STUB/RESOLVE_FAIL/INODE_FAIL/TXN_OPEN_FAIL/UNLINK_FAIL/LINK_FAIL/COMMIT_FAIL) so a downstream test identifies which stage failed. mv.ENH-007 (#23): immediately after Step 3 (src inode resolved), a dry-run gate checks MvArgv::mv_argv_dry_run and, if set, jumps to mv_md_dry_run -- a validation-only exit sharing the standard 5-pop epilogue -- before Step 4 (txn_open) ever runs, so --dry-run opens no TXN, emits no MoveRecord, writes no audit record, and threads no undo record. All Pdxfs::* trampolines are M2 stubs returning 0 (or 1 for handle-returning ones); the R42 substrate landing swaps their bodies without touching this dispatcher. Effects: !{mem, sysreg} for the syscall-clobber shape (mem via kernel WAL writes; sysreg via the syscall rcx/r11 clobber); @{cap} because pdxfs_txn_open mints a fresh KIND_PDXFS_TXN into the caller's cap_table; @{sched} because commit may block on the WAL drain group and the scheduler is entitled to preempt. Labels prefixed mv_md_.",
       block: {
         // ---- Prologue ---------------------------------------------------------
         push rbx;
@@ -478,6 +483,18 @@ module Move = structure {
         // Store src_inode.
         lea r11, [rip + mv_move_src_inode];
         mov [r11], rax;
+
+        // ---- mv.ENH-007 (#23): --dry-run gate ---------------------------------
+        // Everything above this point is "parse + validate + resolve
+        // parents" (doc/mv.pdxdoc §OPTIONS --dry-run contract). If the
+        // caller passed --dry-run, stop here: no TXN opens, no
+        // MoveRecord is emitted, nothing is journaled, nothing is
+        // committed. Previously mv_argv_dry_run was parsed and never
+        // read anywhere, so --dry-run performed a real, committed move.
+        lea r11, [rip + mv_argv_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mv_md_dry_run;
 
         // ---- Step 4: open TXN ------------------------------------------------
         mov rdi, 2;                          // PXT_MODE_MODIFY
@@ -628,6 +645,22 @@ module Move = structure {
         pop rbx;
         ret;
 
+      mv_md_dry_run:
+        // mv.ENH-007 (#23): validation-only exit. No TXN was opened
+        // (nothing to abort), no MoveRecord was emitted, no audit
+        // write, no undo record. MV_ST_MOVES / MV_ST_TXN_* / MV_ST_
+        // CROSS_DIR are NOT bumped -- this was not a move. Jumps past
+        // mv_md_verbose deliberately: there is no was_cross_device /
+        // was_cross_user state to report on a path that never touched
+        // PdxFS.
+        xor rax, rax;                        // MV_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
       mv_md_resolve_src_fail:
         mov rdi, 5;                          // MV_ST_ERRORS
         call mv_note;
@@ -738,7 +771,6 @@ module Move = structure {
         mov rdi, 5;
         call mv_note;
         mov rax, 0xFFFFEB37;                 // MV_MV_COMMIT_FAIL
-        add rsp, 8;
         pop r15;
         pop r14;
         pop r13;
