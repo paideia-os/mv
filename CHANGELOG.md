@@ -7,6 +7,45 @@ and the issues each entry closes.
 
 ---
 
+## Unreleased (Enhancement v1.x)
+
+- `mv.ENH-001` (#17): fixed a stack-frame corruption in
+  `Move::move_dispatch`'s commit-fail epilogue (`src/move.pdx`) --
+  a stray `add rsp, 8` broke the 5-push/5-pop parity, corrupting
+  the `ret` target and four callee-saves the instant
+  `pdxfs_txn_commit` stops being a stub. The branch was unreachable
+  at 1.0.0 (the stub always returns 0), so it shipped green.
+- `mv.ENH-008` (#24): `Audit::mv_audit_write_move` now reports every
+  move through libpdx-audit's `AuditClient` three-call lifecycle
+  (`audit_begin` / `audit_record_output` / `audit_commit`) instead of
+  hand-rolling raw `sys_svc_lookup` + `sys_ipc_send` against
+  `svc.audit-journal` with a wire shape that disagreed with
+  `AuditBroker`'s real dispatch. `deps.list` / `manifest.pdxsig`
+  corrected to the two libraries actually linked (`libpdx-argv`,
+  `libpdx-audit`); `libpdx-cap`, `libpdx-semantic-pipe`, and
+  `libpdx-elevate` were claimed but never called and are removed.
+- `mv.ENH-006` (#22): `MvArgv::mv_argv_parse` now accepts `--verbose`
+  as a long spelling of `-v`. `doc/mv.pdxdoc` corrected to drop the
+  false claims that `-v` prints a generic `mv <src> <dst>` line and
+  that POSIX `-f`/`-n` are "covered by `-i`" (neither is true of the
+  source); `--interactive` stays undocumented as a working flag
+  since `-i` still has no consumer (mv.ENH-005 blocks on `KIND_TTY`).
+- `mv.ENH-009` (#25): `doc/mv.pdxdoc`, `CHANGELOG.md`, and
+  `manifest.pdxsig` corrected to the MoveRecord layout `src/schema.pdx`
+  and `src/undo.pdx` actually build -- 80-byte record under schema id
+  `0xFFFFEB5000000001` (not the pre-M3 64-byte / `0x4D56` fossil), and
+  undo magic `0xFFFFEB7000000001` (not `0x4D566E52`). See the erratum
+  under M3 below.
+- `mv.ENH-007` (#23): `--dry-run` now actually gates `Move::move_
+  dispatch` -- after resolving both parents and the source inode
+  (the "parse + validate + resolve" contract the doc always claimed),
+  a dry-run returns success without opening a TXN, emitting a
+  MoveRecord, writing the audit journal, or threading an undo record.
+  Previously `mv_argv_dry_run` was parsed and read by nothing, so
+  `mv --dry-run a b` performed a real, committed move.
+
+---
+
 ## 1.0.0 — 2026-08-22 (R50 Wave 2 close)
 
 First dual-signed release. mv is source-complete + audit-complete
@@ -41,6 +80,15 @@ acceptance smoke (mv a b; pdx-undo; ls) waits on R42 + shell.M5
   end-to-end QEMU smoke. 16 codes in band 0xFFFFEBEx.
 
 ### M3 — semantic-pipe / audit integration
+
+> **Erratum (mv.ENH-009, #25):** the schema id / record size and undo
+> magic named below were pre-M3 placeholders that were never updated
+> to match the M3-001/M3-003 implementation, and M3-002's "via
+> libpdx-audit" claim was not actually true until mv.ENH-008 (#24).
+> The record `src/schema.pdx` builds is 80 bytes under schema id
+> `0xFFFFEB5000000001`; the undo magic `src/undo.pdx` builds is
+> `0xFFFFEB7000000001`. See the Unreleased section above.
+
 - `mv.M3-001` (#8): MoveRecord[] schema bind (schema id 0x4D56,
   64-byte record, was_rename + was_cross_device + was_cross_user
   + elevated flags) + emit at Schema::mv_schema_emit.

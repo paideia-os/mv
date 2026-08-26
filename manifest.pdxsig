@@ -49,12 +49,13 @@ digest        = pending:caps-decl-blake3-256
 
 [deps]
 # Shared-library dependencies per deps.list; pkg install resolves
-# each against the semver constraint before staging.
-libpdx-cap           >= 1.0.0
+# each against the semver constraint before staging. Corrected by
+# mv.ENH-008 (paideia-os/mv#24) to the two libraries src/ actually
+# calls -- libpdx-cap, libpdx-semantic-pipe, and libpdx-elevate were
+# claimed here but never linked (see deps.list header for the
+# per-module resolution).
 libpdx-argv          >= 1.0.0
-libpdx-semantic-pipe >= 1.0.0
 libpdx-audit         >= 1.0.0
-libpdx-elevate       >= 1.0.0
 
 [artifacts]
 # Files that ship in pkg.tar. Digests are BLAKE3-256 over each file's
@@ -80,12 +81,17 @@ src/pdxfs.pdx    = pending:src-pdxfs-blake3-256
 
 [schemas]
 # Semantic-pipe schemas mv emits (D2). Bound at M3-001 in src/schema.pdx.
-MoveRecord = 0x4D56  # 64 bytes; fields per doc/mv.pdxdoc .TOPIC schemas
+# Corrected by mv.ENH-009 (paideia-os/mv#25) -- this stanza named a
+# pre-M3 placeholder (schema id 0x4D56, 64 bytes) that was never
+# updated to match the M3-001 implementation.
+MoveRecord = 0xFFFFEB5000000001  # 80 bytes; fields per doc/mv.pdxdoc .TOPIC schemas
 
 [undo]
 # PdxFS v1 undo record shape threaded by Undo::mv_undo_write on commit
-# (D3 audit-first + I5 destructive-op undo).
-magic         = 0x4D566E52
+# (D3 audit-first + I5 destructive-op undo). Corrected by mv.ENH-009
+# (paideia-os/mv#25) -- magic was a pre-M3 placeholder never updated
+# to match the M3-003 implementation in src/undo.pdx.
+magic         = 0xFFFFEB7000000001
 replay_opcode = 0x6D76        # 'mv' in little-endian ASCII
 replay        = mv <dst> <src>
 

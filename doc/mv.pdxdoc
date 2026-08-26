@@ -8,7 +8,7 @@
 
 .TOPIC synopsis
 .HEAD SYNOPSIS
-mv [-v|-i|--dry-run] <src> <dst>
+mv [-v|--verbose] [-i] [--dry-run] <src> <dst>
 
 Move (or rename) SRC onto DST inside a single PdxFS v1 transaction.
 Success is atomic: at commit boundary the source dirent is gone and the
@@ -42,26 +42,41 @@ mv handles four move shapes inside one dispatch entry
                   records the degrade.
 
 Every successful mv emits ONE MoveRecord on the semantic pipe
-(schema id 0x4D56 "MV") carrying (src_path_ptr, dst_path_ptr,
-inode_id, was_rename, was_cross_device, was_cross_user, elevated)
-before any user-visible output leaves the process (D3 audit-first).
-The MoveRecord is journaled to /system/audit/user-events/ via
-libpdx-audit before the TXN commit; on the commit path Undo::
-mv_undo_write threads a PdxFS undo record whose replay is
-`mv <dst> <src>` -- pdx-undo (R51) reads it and reverses the op.
+(schema id 0xFFFFEB5000000001) carrying (magic, was_rename,
+was_cross_device, was_cross_user, src_ptr, dst_ptr, src_inode,
+src_parent, dst_parent, txn_handle) before any user-visible output
+leaves the process (D3 audit-first). The move is also reported to
+/system/audit/user-events/ via libpdx-audit's AuditClient lifecycle
+(audit_begin / audit_record_output / audit_commit) before the TXN
+commit; on the commit path Undo::mv_undo_write threads a PdxFS undo
+record whose replay is `mv <dst> <src>` -- pdx-undo (R51) reads it
+and reverses the op.
 
 .TOPIC options
 .HEAD OPTIONS
-  -v, --verbose      print `mv <src> <dst>` to stderr on success; adds
-                     was_cross_device / was_cross_user flags when set.
+  -v, --verbose      on a successful commit, print one advisory line
+                     per condition that fired: "mv: crossed device
+                     (cp+rm fallback, not O(1))" if the cross-device
+                     fallback ran, and/or "mv: crossed user (inode
+                     kept old owner)" if the cross-user rebind
+                     degraded. Prints nothing if neither condition
+                     fired -- it does not echo `mv <src> <dst>`.
 
-  -i, --interactive  ask before overwriting an existing dst (M2 stub;
-                     live prompt lands with shell.M4 line reader
-                     accessible from within mv via KIND_TTY).
+  -i                 parsed, no consumer yet -- the confirm prompt
+                     needs a TTY line reader (KIND_TTY, shell.M4)
+                     this tree does not have. The destination-clobber
+                     guard this flag will gate (refuse-by-default
+                     when dst already exists) is tracked separately
+                     as mv.ENH-004 and does not yet exist either, so
+                     `mv src dst` silently overwrites an existing
+                     dst today.
 
-      --dry-run      parse + validate + resolve parents; report the
-                     move-shape that WOULD run; do not open the TXN,
-                     do not emit a MoveRecord, do not journal.
+      --dry-run      resolve both parents and the source inode
+                     (parse + validate + resolve), then return
+                     success without opening the TXN, without
+                     emitting a MoveRecord, without journaling, and
+                     without threading an undo record. Nothing is
+                     written.
 
 .TOPIC exit_codes
 .HEAD EXIT CODES
@@ -123,17 +138,23 @@ before any TXN is opened.
 .HEAD OUTPUT SCHEMAS
 mv emits ONE typed schema on its semantic pipe:
 
-  MoveRecord[] (schema id 0x4D56 "MV", record size 64 bytes)
+  MoveRecord[] (schema id 0xFFFFEB5000000001, record size 80 bytes,
+  ten u64 fields at src/schema.pdx's fixed offsets)
     fields:
-      src_path_ptr    u64  caller-owned pointer to src argv slot
-      dst_path_ptr    u64  caller-owned pointer to dst argv slot
-      inode_id        u64  the moved inode's PdxFS id
-      was_rename      u8   1 if src_parent == dst_parent
-      was_cross_dev   u8   1 if the cross-device fallback fired
-      was_cross_user  u8   1 if dst_parent's owner != src's owner
-      elevated        u8   1 if the elevate hop succeeded
-      reserved        u32  zero
-      _pad            [u64; 3]  reserves the record at 64 bytes
+      magic           u64  MOVE_RECORD_MAGIC (schema id, offset 0)
+      was_rename      u64  1 if src_parent == dst_parent
+      was_cross_device u64 1 if the cross-device fallback fired
+      was_cross_user  u64  1 if dst_parent's owner != src's owner
+      src_ptr         u64  caller-owned pointer to the source path
+      dst_ptr         u64  caller-owned pointer to the destination path
+      src_inode       u64  the moved inode's PdxFS id
+      src_parent      u64  source parent directory inode
+      dst_parent      u64  destination parent directory inode
+      txn_handle      u64  correlates the record to PdxFS TXN state
+
+There is no `elevated` field -- the elevate hop's outcome is not
+carried in MoveRecord at this release; a denied elevate is only
+observable via the -v advisory or the graceful-degrade owner tail.
 
 Downstream consumers filter, sort, or plot MoveRecord[] by any of
 these fields via the D2 semantic-pipe convention -- no column
@@ -141,18 +162,20 @@ slicing.
 
 .TOPIC audit
 .HEAD AUDIT
-Every successful mv writes ONE user-events journal record via
+Every successful mv reports itself to the user-events journal via
 libpdx-audit before the TXN commit (D3 audit-first: an mv that
-cannot log itself is refused). The audit-journal broker name is
-`svc.audit-journal`; Audit::mv_audit_write_move builds the record
-in the caller-owned frame and dispatches it via sys_ipc_send
-(negative errno on send failure aborts the TXN).
+cannot log itself is refused). Audit::mv_audit_write_move drives
+libpdx-audit's AuditClient three-call lifecycle -- audit_begin("mv"),
+audit_record_output(audit_id, "MoveRecord@0.1", output_hash), then
+audit_commit(audit_id, exit_code) -- which itself binds
+`svc.audit-journal` and issues the sys_ipc_send wire libpdx-audit
+owns. A non-zero return from any of the three calls aborts the TXN.
 
 .TOPIC undo
 .HEAD UNDO
 On the commit path Undo::mv_undo_write threads a PdxFS v1 undo
-record (magic 0x4D566E52, replay opcode 0x6D76) whose fields are
-the swap:
+record (magic 0xFFFFEB7000000001, replay opcode 0x6D76) whose fields
+are the swap:
 
   replay_src  <-  dst
   replay_dst  <-  src
@@ -217,9 +240,13 @@ axes:
                    PaideiaOS mv threads a WAL undo record so
                    pdx-undo replays the reverse mv.
 
-The POSIX flags -f (force) and -n (no-clobber) are covered by
--i (interactive, M2 stub -- interactive prompt lands with the
-shell.M4 line reader accessible from within mv via KIND_TTY).
+POSIX -f (force) has no equivalent here -- mv never prompts today
+(-i has no consumer; see .TOPIC options), so every mv already
+behaves as if -f were implied. POSIX -n (no-clobber) has no
+equivalent either: mv does not check whether dst exists before
+linking over it, so an existing dst is silently overwritten with
+no record of what was destroyed (mv.ENH-004 tracks the guard;
+mv.ENH-005 tracks wiring it to -i's prompt once KIND_TTY lands).
 POSIX -u (only-if-newer) is deferred to M6+ (no user demand at
 first-slice; a future refinement).
 
@@ -250,6 +277,10 @@ first-slice; a future refinement).
             #12-#14, LANDED 2026-08-22).
   R50 M5    dual-signed release + .pdxdoc + mirror push
             (issues #15-#16, this release, 2026-08-22).
+  Enh v1.x  stack-frame fix (#17), libpdx-audit AuditClient wire-up
+            + deps.list correction (#24), --verbose long spelling +
+            false -v/-i claims stripped (#22), stale schema/undo
+            magic reconciliation (#25), --dry-run TXN gate (#23).
 
 .TOPIC bugs
 .HEAD KNOWN LIMITATIONS
@@ -261,6 +292,16 @@ this release, but the QEMU acceptance smoke (mv a b; pdx-undo;
 ls) waits on R42 + shell.M5 + pdx-undo. See `tests/README.md`
 for the live-harness runbook and the fault-injection extension
 that lands as a Round-2 amendment when R42 closes.
+
+There is no `_start` frame in this tree (mv.ENH-002, #18): mv is a
+set of well-formed modules, not yet a runnable program. There is no
+cwd-relative path resolution (mv.ENH-003, #19). An existing dst is
+silently overwritten with no record of what was destroyed -- the
+undo record cannot recover a clobbered destination either, since it
+only restores the moved file to its original name (mv.ENH-004, #20).
+The multi-source form `mv f1 f2 ... dir/` is not implemented
+(mv.ENH-011, #27). These are open issues tracked against the
+Enhancement v1.x milestone, not regressions in this release.
 
 .TOPIC author
 .HEAD AUTHOR

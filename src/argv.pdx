@@ -17,9 +17,9 @@
 //      Parser::parse_argv on the caller's argv array.
 //   2. Walk libpdx-argv's flag_names / flag_count and byte-compare
 //      every observed flag name against the mv whitelist:
-//        "v"        → mv_argv_verbose = 1
-//        "i"        → mv_argv_interactive = 1
-//        "dry-run"  → mv_argv_dry_run = 1
+//        "v" / "verbose"  → mv_argv_verbose = 1  (mv.ENH-006, #22)
+//        "i"              → mv_argv_interactive = 1
+//        "dry-run"        → mv_argv_dry_run = 1
 //      Any other name → MV_ARG_UNKNOWN_FLAG, with the offending
 //      flag_names index recorded to mv_argv_error_flag_index for
 //      the M2 stderr diagnostic renderer.
@@ -159,7 +159,7 @@ module Argv = structure {
   pub let mv_argv_parse : (u64, u64) -> u64 !{mem} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M1-002 (#2): argv surface for mv. Four callee-save pushes (r12=argc, r13=argv, r14=flag loop index, r15=flag name pointer) preserve state across nested SysV calls (mv_argv_reset, reset -- ParsedArgs, parse_argv -- Parser, mv_note). `sub rsp, 8` balances rsp % 16 to 0 for those calls, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). Whitelist compare is inline byte-by-byte against \"v\\0\", \"i\\0\", \"dry-run\\0\" -- same pattern libpdx-argv uses for pdx-schema in parser.pdx. Every byte read uses `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation). `cmp rax, 0x7F..` immediate byte values are all <= 0x7F, well under the 0x7FFFFFFF cap. Flag/pos counters are read once and staged in r10 to avoid re-loading on every iteration. Errors bump MV_ST_ERRORS and populate mv_argv_error_flag_index for M2's diagnostic renderer. Labels prefixed mv_ap_.",
+      justification: "mv.M1-002 (#2): argv surface for mv. Four callee-save pushes (r12=argc, r13=argv, r14=flag loop index, r15=flag name pointer) preserve state across nested SysV calls (mv_argv_reset, reset -- ParsedArgs, parse_argv -- Parser, mv_note). `sub rsp, 8` balances rsp % 16 to 0 for those calls, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). Whitelist compare is inline byte-by-byte against \"v\\0\" / \"verbose\\0\" (mv.ENH-006, #22), \"i\\0\", \"dry-run\\0\" -- same pattern libpdx-argv uses for pdx-schema in parser.pdx. Every byte read uses `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation). `cmp rax, 0x7F..` immediate byte values are all <= 0x7F, well under the 0x7FFFFFFF cap. Flag/pos counters are read once and staged in r10 to avoid re-loading on every iteration. Errors bump MV_ST_ERRORS and populate mv_argv_error_flag_index for M2's diagnostic renderer. Labels prefixed mv_ap_.",
       block: {
         push r12;
         push r13;
@@ -209,10 +209,22 @@ module Argv = structure {
         lea r11, [rip + flag_names];
         mov r15, [r11 + r14*8];              // r15 = current flag name pointer
 
-        // Try "v": byte0 == 'v' (0x76), byte1 == NUL.
+        // Try "v" or "verbose": byte0 == 'v' (0x76) is shared by both.
         xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x76; jne mv_ap_try_i;
-        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    jne mv_ap_try_i;
-        // Match "v" -> mv_argv_verbose = 1.
+        // byte0 matched 'v' -- disambiguate short "v" (NUL at byte1)
+        // from long "verbose" (mv.ENH-006, paideia-os/mv#22) on byte1.
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    je  mv_ap_match_v;
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0x65; jne mv_ap_unknown_flag;  // 'e'
+        xor rax, rax; mov_b rax, [r15 + 2]; cmp rax, 0x72; jne mv_ap_unknown_flag;  // 'r'
+        xor rax, rax; mov_b rax, [r15 + 3]; cmp rax, 0x62; jne mv_ap_unknown_flag;  // 'b'
+        xor rax, rax; mov_b rax, [r15 + 4]; cmp rax, 0x6F; jne mv_ap_unknown_flag;  // 'o'
+        xor rax, rax; mov_b rax, [r15 + 5]; cmp rax, 0x73; jne mv_ap_unknown_flag;  // 's'
+        xor rax, rax; mov_b rax, [r15 + 6]; cmp rax, 0x65; jne mv_ap_unknown_flag;  // 'e'
+        xor rax, rax; mov_b rax, [r15 + 7]; cmp rax, 0;    jne mv_ap_unknown_flag;  // NUL
+        // Matched "verbose" -- fall through to the same store as "v".
+
+      mv_ap_match_v:
+        // Match "v" / "verbose" -> mv_argv_verbose = 1.
         mov rax, 1;
         lea r11, [rip + mv_argv_verbose];
         mov [r11], rax;

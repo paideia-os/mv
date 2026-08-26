@@ -138,6 +138,18 @@ module Schema = structure {
   pub let MV_SEMPIPE_FD : u64 = 1
 
   // ==========================================================================
+  // Audit output-schema label (mv.ENH-008, paideia-os/mv#24)
+  //
+  // 15 bytes = "MoveRecord@0.1" (14) + NUL. Audit::mv_audit_write_move
+  // reads this pointer as the output_schema argument to libpdx-audit's
+  // AuditClient::audit_record_output -- same convention as rm's
+  // RmSchema::SCHEMA_LABEL ("RemoveRecord@0.1") consumed by
+  // Audit::audit_record_target in paideia-os/rm src/audit.pdx.
+  // ==========================================================================
+  pub let SCHEMA_LABEL     : [u8; 15] = "MoveRecord@0.1\0"
+  pub let SCHEMA_LABEL_LEN : u64      = 14
+
+  // ==========================================================================
   // Return-code band 0xFFFFEB5x (Schema layer)
   //
   //   0xFFFFEB50 MV_SCH_STUB          reserved / unused at M3-001

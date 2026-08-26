@@ -13,9 +13,22 @@
 # Order matches src/ file order (mv, argv, rename, move, inode,
 # schema, audit, undo, elevate, verbose, pdxfs) so a reviewer can
 # cross-check module-level dependencies against link-list entries.
+#
+# mv.ENH-008 (paideia-os/mv#24): this list originally named five
+# libraries but only one (libpdx-argv) was ever actually called --
+# src/mv.pdx + src/inode.pdx, src/schema.pdx, and src/elevate.pdx all
+# use LOCAL trampolines against the raw R20b/PdxFS syscalls instead of
+# libpdx-cap / libpdx-semantic-pipe / libpdx-elevate, so those three
+# entries were spurious install-time failure modes (`pkg install mv`
+# enforces every entry's semver constraint). libpdx-audit is now also
+# real: src/audit.pdx calls its AuditClient (audit_begin /
+# audit_record_output / audit_commit) instead of hand-rolling raw IPC
+# against svc.audit-journal in a shape AuditBroker did not agree with.
+# The other three entries are removed rather than kept-and-noted: an
+# installer-enforced dependency the source never calls is a defect,
+# not documentation debt. Re-add libpdx-cap / libpdx-semantic-pipe /
+# libpdx-elevate here in the SAME commit that wires src/mv.pdx+src/
+# inode.pdx, src/schema.pdx, or src/elevate.pdx to the real crate.
 
-libpdx-cap             1.0.0   # cap-manifest verify at exec + cap narrowing; src/mv.pdx + src/inode.pdx (signed-inode helpers)
 libpdx-argv            1.0.0   # argv surface + flag parse; src/argv.pdx
-libpdx-semantic-pipe   1.0.0   # MoveRecord[] schema emit; src/schema.pdx
-libpdx-audit           1.0.0   # user-events journal client; src/audit.pdx
-libpdx-elevate         1.0.0   # cross-user broker hop; src/elevate.pdx
+libpdx-audit           1.0.0   # user-events journal client (AuditClient); src/audit.pdx

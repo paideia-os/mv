@@ -7,12 +7,12 @@ whose replay is `mv <dst> <src>`.
 ## Synopsis
 
 ```
-mv [-v] [-i] [--dry-run] <src> <dst>
+mv [-v|--verbose] [-i] [--dry-run] <src> <dst>
 ```
 
 Exactly two positionals are required. `MvArgv::mv_argv_parse` rejects any
 other positional count with `MV_ARG_TOO_FEW_POS` and any flag outside the
-whitelist `{v, i, dry-run}` with `MV_ARG_UNKNOWN_FLAG` (`src/argv.pdx`).
+whitelist `{v, verbose, i, dry-run}` with `MV_ARG_UNKNOWN_FLAG` (`src/argv.pdx`).
 The multi-source form `mv f1 f2 … dir/` is not accepted at 1.0.0.
 
 ## Description
@@ -53,9 +53,13 @@ reverse.
 
 `mv` is a Category-A coreutil in wave R50 of paideia-os, released as `v1.0.0`
 (2026-08-22, dual-signed with `manifest.pdxsig` in the SHAPE-PENDING state
-described in `RELEASE.md`). It links five shared libraries per `deps.list`:
-`libpdx-cap`, `libpdx-argv`, `libpdx-semantic-pipe`, `libpdx-audit`,
-`libpdx-elevate`.
+described in `RELEASE.md`). It links two shared libraries per `deps.list`:
+`libpdx-argv` (`src/argv.pdx`) and `libpdx-audit` (`src/audit.pdx`, via its
+`AuditClient`, mv.ENH-008). `deps.list` previously also claimed `libpdx-cap`,
+`libpdx-semantic-pipe`, and `libpdx-elevate`, but `src/mv.pdx` + `src/inode.pdx`,
+`src/schema.pdx`, and `src/elevate.pdx` all use local trampolines against the
+raw kernel syscalls instead — those three entries were removed (mv.ENH-008,
+#24).
 
 **Substrate caveat.** Every `Pdxfs::*` trampoline in `src/pdxfs.pdx` is still an
 M2 stub that returns `0` (or `1` for handle-valued calls) without issuing a
@@ -83,19 +87,18 @@ three default to `0`.
 
 | Short | Long        | Argument | Default | Description |
 |-------|-------------|----------|---------|-------------|
-| `-v`  | —           | none     | `0`     | Emit the cross-device / cross-user advisories on stderr (fd 2) after a successful commit. Sets `mv_argv_verbose`. |
+| `-v`  | `--verbose` | none     | `0`     | Emit the cross-device / cross-user advisories on stderr (fd 2) after a successful commit. Sets `mv_argv_verbose`. |
 | `-i`  | —           | none     | `0`     | Interactive. Parsed into `mv_argv_interactive`; **no consumer at 1.0.0** — the prompt lands with the shell.M4 line reader reachable through `KIND_TTY`. |
-| —     | `--dry-run` | none     | `0`     | Parse-and-validate only. Parsed into `mv_argv_dry_run`; **no consumer at 1.0.0** — `move_dispatch` does not yet gate on it. |
+| —     | `--dry-run` | none     | `0`     | Parse + validate + resolve parents only (mv.ENH-007, #23). `move_dispatch` checks `mv_argv_dry_run` immediately after resolving both parents and the source inode, and returns success without opening a TXN, emitting a MoveRecord, writing the audit journal, or threading an undo record. |
 
-Two caveats that the source contradicts the `.pdxdoc` on, and which the source
+One caveat that the source contradicts the `.pdxdoc` on, and which the source
 wins:
 
-- The long spellings `--verbose` and `--interactive` documented in
-  `doc/mv.pdxdoc` are **not** accepted. The whitelist compares against the
-  literal names `"v"`, `"i"`, `"dry-run"`; anything else returns
-  `MV_ARG_UNKNOWN_FLAG` with the offending index left in
-  `mv_argv_error_flag_index`.
-- `-v` does not print a generic `mv <src> <dst>` line. `Verbose::mv_verbose_diag`
+- `--interactive` (the long spelling of `-i`) is **not** accepted. The
+  whitelist compares against the literal names `"v"`, `"verbose"`, `"i"`,
+  `"dry-run"`; anything else returns `MV_ARG_UNKNOWN_FLAG` with the offending
+  index left in `mv_argv_error_flag_index`.
+- `-v` / `--verbose` does not print a generic `mv <src> <dst>` line. `Verbose::mv_verbose_diag`
   emits only the two advisories, and only when the corresponding flag fired:
 
   ```
@@ -172,7 +175,7 @@ The effect and capability rows on the entry points, verbatim from source:
 Move::move_dispatch          : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
 Move::move_cross_dev_body    : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
 MvArgv::mv_argv_parse        : (u64, u64) -> u64 !{mem}         @{}
-Audit::mv_audit_write_move   : ()         -> u64 !{mem, sysreg} @{cap}
+Audit::mv_audit_write_move   : ()         -> u64 !{mem, sysreg} @{cap, sched}
 Undo::mv_undo_write          : (u64)      -> u64 !{mem, sysreg} @{}
 Schema::mv_schema_emit       : ()         -> u64 !{mem, sysreg} @{}
 Elevate::mv_elevate_cross_user : (u64)    -> u64 !{mem, sysreg} @{cap}
@@ -232,9 +235,13 @@ Three fixed-layout records are built in `.bss` and shipped off the process.
 All fields are `u64`; all offsets are literal in the emitting assembly.
 
 **MoveRecord** — 80 bytes, `src/schema.pdx`. Populated by
-`mv_schema_populate(src_ptr, dst_ptr)`, emitted on the semantic pipe, and sent
-verbatim as the `sys_ipc_send` payload to `svc.audit-journal` by
-`Audit::mv_audit_write_move` before the commit.
+`mv_schema_populate(src_ptr, dst_ptr)` and emitted on the semantic pipe by
+`Schema::mv_schema_emit`. `Audit::mv_audit_write_move` (mv.ENH-008, #24) no
+longer sends this record verbatim to `svc.audit-journal` itself — it reports
+the move through libpdx-audit's `AuditClient` three-call lifecycle
+(`audit_begin` / `audit_record_output` / `audit_commit`), the same wire rm
+uses, with the record's `src_ptr` field carried as `audit_record_output`'s
+placeholder `output_hash`.
 
 | Offset | Field | Notes |
 |--------|-------|-------|
@@ -276,10 +283,12 @@ by `mv_elevate_cross_user(dst_owner_key)` on the cross-user path.
 | 16 | `requested_key` | the destination owner's key to sign under |
 | 24 | `duration_secs` | `MV_ELV_WINDOW_SECS` = `60` |
 
-Note that `doc/mv.pdxdoc`, `CHANGELOG.md`, and the `manifest.pdxsig` stanzas
-describe the MoveRecord as 64 bytes under schema id `0x4D56` and the undo magic
-as `0x4D566E52`. Those predate the M3 implementation; the layouts above are what
-`src/schema.pdx` and `src/undo.pdx` actually build and are authoritative.
+`doc/mv.pdxdoc` and `manifest.pdxsig` previously described the MoveRecord as 64
+bytes under schema id `0x4D56` and the undo magic as `0x4D566E52` — pre-M3
+placeholders that were never updated to match the M3 implementation. Both were
+corrected to the layouts above by mv.ENH-009 (#25); `CHANGELOG.md`'s historical
+M3 entry keeps the original (wrong) numbers with an erratum note rather than
+rewriting release history.
 
 ## See also
 
