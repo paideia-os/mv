@@ -117,14 +117,41 @@ module Mv = structure {
   pub let MV_ARG_UNKNOWN_FLAG   : u64 = 0xFFFFEB14   // flag not in {v,i,dry-run}
   pub let MV_ARG_PARSE_ERR      : u64 = 0xFFFFEB15   // libpdx-argv reported ERR_*
 
-  // Rename stubs and errors (0xFFFFEB2x)
-  pub let MV_RN_STUB            : u64 = 0xFFFFEB20   // M1: validated, no live TXN
+  // Rename stubs and errors (0xFFFFEB2x). MV_RN_STUB is RETIRED at
+  // v1.1-A -- Rename::rename_same_dir now dispatches real sys_rename
+  // (sysno 82) with an sys_open/read/write/unlink fallback on -EXDEV.
+  // The M2+ TXN-shaped MV_RN_TXN_OPEN_FAIL / _UNLINK_FAIL / _LINK_FAIL
+  // / _COMMIT_FAIL slots stay reserved (unused by the v1.1-A path;
+  // Move::move_dispatch retains its own MV_MV_TXN_* band for the
+  // PdxFS-TXN-mediated general-mv path when R42 substrate lands).
+  pub let MV_RN_STUB            : u64 = 0xFFFFEB20   // RETIRED at v1.1-A; reserved
   pub let MV_RN_BAD_SRC         : u64 = 0xFFFFEB21   // src == 0
   pub let MV_RN_BAD_DST         : u64 = 0xFFFFEB22   // dst == 0
-  pub let MV_RN_TXN_OPEN_FAIL   : u64 = 0xFFFFEB23   // M2+: sys_pdxfs_txn_open refused
-  pub let MV_RN_UNLINK_FAIL     : u64 = 0xFFFFEB24   // M2+: sys_pdxfs_unlink refused
-  pub let MV_RN_LINK_FAIL       : u64 = 0xFFFFEB25   // M2+: sys_pdxfs_link refused
-  pub let MV_RN_COMMIT_FAIL     : u64 = 0xFFFFEB26   // M2+: sys_pdxfs_txn_commit refused
+  pub let MV_RN_TXN_OPEN_FAIL   : u64 = 0xFFFFEB23   // reserved (M2+ TXN path)
+  pub let MV_RN_UNLINK_FAIL     : u64 = 0xFFFFEB24   // reserved (M2+ TXN path)
+  pub let MV_RN_LINK_FAIL       : u64 = 0xFFFFEB25   // reserved (M2+ TXN path)
+  pub let MV_RN_COMMIT_FAIL     : u64 = 0xFFFFEB26   // reserved (M2+ TXN path)
+
+  // v1.1-A Rename direct-syscall codes (0xFFFFEB27..0xFFFFEB2D). Emitted
+  // by Rename::rename_same_dir after the M1-003 STUB was retired:
+  //   MV_RN_RENAME_FAIL           sys_rename refused with non-EXDEV neg errno
+  //   MV_RN_XDEV_OPEN_SRC_FAIL    -EXDEV fallback: sys_open(src, RDONLY) failed
+  //   MV_RN_XDEV_OPEN_DST_FAIL    -EXDEV fallback: sys_open(dst, WR|CR) failed
+  //   MV_RN_XDEV_READ_FAIL        -EXDEV fallback: sys_read failed mid-copy
+  //   MV_RN_XDEV_WRITE_FAIL       -EXDEV fallback: sys_write failed mid-copy
+  //   MV_RN_XDEV_SHORT_WRITE      -EXDEV fallback: sys_write returned < requested
+  //   MV_RN_XDEV_UNLINK_FAIL      -EXDEV fallback: sys_unlink(src) refused after copy
+  //
+  // These are DIRECT-SYSCALL codes -- distinct from Move::move_cross_dev_body's
+  // 0xFFFFEB3[89ABCD] MV_MV_XDEV_* band which describes the TXN-wrapped
+  // cross-device path move_dispatch runs.
+  pub let MV_RN_RENAME_FAIL          : u64 = 0xFFFFEB27
+  pub let MV_RN_XDEV_OPEN_SRC_FAIL   : u64 = 0xFFFFEB28
+  pub let MV_RN_XDEV_OPEN_DST_FAIL   : u64 = 0xFFFFEB29
+  pub let MV_RN_XDEV_READ_FAIL       : u64 = 0xFFFFEB2A
+  pub let MV_RN_XDEV_WRITE_FAIL      : u64 = 0xFFFFEB2B
+  pub let MV_RN_XDEV_SHORT_WRITE     : u64 = 0xFFFFEB2C
+  pub let MV_RN_XDEV_UNLINK_FAIL     : u64 = 0xFFFFEB2D
 
   // Move (M2-001) stubs and errors (0xFFFFEB3x). The Move module
   // in src/move.pdx handles both the same-directory rename case

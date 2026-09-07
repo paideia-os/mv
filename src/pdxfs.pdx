@@ -253,6 +253,15 @@ module Pdxfs = structure {
   pub let SYS_OPEN  : u64 = 2
   pub let SYS_CLOSE : u64 = 3
 
+  // v1.1-A path-based syscalls (mirror paideia-os design/user/syscall-table.md
+  // rows 81 + 82). sys_unlink and sys_rename are LIVE in the kernel today
+  // (R56.M3-005 landing at paideia-os src/kernel/core/syscall/sys_unlink.pdx;
+  // sys_rename adjacent) -- Rename::rename_same_dir consumes them directly
+  // without the PdxFS v1 TXN wrapper the M1-003 STUB was scheduled against,
+  // avoiding the R42 substrate dependency for v1.1-A.
+  pub let SYS_UNLINK : u64 = 81
+  pub let SYS_RENAME : u64 = 82
+
   // O_* mirrors (mirror paideia-os src/kernel/core/fs/vfs_open.pdx L36-38)
   pub let O_RDONLY : u64 = 0
   pub let O_WRONLY : u64 = 1
@@ -324,6 +333,63 @@ module Pdxfs = structure {
       justification: "mv.M2-002 (#5): pdxfs_close trampoline. Real sys_close (sysno 3). Arity 1. Return: 0 on success, negative errno on failure. Leaf; sysreg for SYSRET clobber. Callers ignore return in error paths -- the fd is released at task teardown regardless.",
       block: {
         mov rax, 3;                            // SYSCALL_CLOSE
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_rename(old_ptr, old_len, new_ptr, new_len) -> 0_or_errno
+  //
+  // v1.1-A same-filesystem atomic rename fast path. Directly dispatches
+  // sysno 82 (paideia-os design/user/syscall-table.md row 82) -- the
+  // kernel-side sys_rename walks both paths (path_len_hint field is a
+  // walker CAP per the table's postscript, not an exact strlen; passing
+  // the caller's own strlen is both a correctness (upper bound) and a
+  // tightness (no over-walk) improvement over passing 0).
+  //
+  // RDI = old_ptr, RSI = old_len, RDX = new_ptr, RCX = new_len.
+  // Syscall wants arg4 in R10 -- the SysV-rcx-to-syscall-r10 shuffle
+  // matches pdxfs_link's arity-4 convention.
+  //
+  // Return: 0 on success; -EXDEV (0xFFFFFFFFFFFFFFEE) if the two paths
+  // resolve to different devices (Rename's v1.1-A dispatcher falls back
+  // to the byte-copy + unlink path on that specific errno); any other
+  // negative errno indicates a hard failure (permission, ENOENT, EIO...).
+  // ==========================================================================
+  pub let sys_rename : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (old_ptr: u64) (old_len: u64) (new_ptr: u64) (new_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.v1.1-A: sys_rename trampoline. Real syscall (sysno 82 -- paideia-os design/user/syscall-table.md row 82; kernel dispatcher live at src/kernel/core/syscall/sys_unlink.pdx-adjacent sys_rename.pdx per R56.M3-005). Arity 4 requires the SysV-rcx-to-syscall-r10 shuffle (`mov r10, rcx`), same idiom pdxfs_link uses. Return: 0 on success; -EXDEV (0xFFFFFFFFFFFFFFEE) on cross-device refusal (Rename dispatcher falls through to byte-copy + unlink); any other negative errno is a hard fail. Leaf; sysreg for SYSRET rcx/r11 clobber. path_len_hint (the len fields) is a walker CAP per the syscall-table postscript, NOT an exact strlen -- passing caller's own strlen is both an upper bound and a tightness win over passing 0.",
+      block: {
+        mov r10, rcx;                          // SysV rcx -> syscall r10 (arg4)
+        mov rax, 82;                           // SYS_RENAME
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_unlink_path(path_ptr, path_len_hint) -> 0_or_errno
+  //
+  // v1.1-A plain path-based unlink for the byte-copy fallback tail.
+  // Directly dispatches sysno 81 (paideia-os design/user/syscall-table.md
+  // row 81) -- NOT the TXN-wrapped Pdxfs::pdxfs_unlink stub above (which
+  // targets the R42 PdxFS v1 substrate's txn/parent_inode/basename shape).
+  //
+  // Named `sys_unlink_path` (not `sys_unlink`) to avoid symbol collision
+  // with the existing `pdxfs_unlink` STUB while making the path-based
+  // (as opposed to TXN-based) nature explicit at the call site.
+  //
+  // RDI = path_ptr, RSI = path_len_hint (walker CAP, not exact strlen).
+  // Return: 0 on success, negative errno on failure.
+  // ==========================================================================
+  pub let sys_unlink_path : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) (path_len_hint: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.v1.1-A: sys_unlink_path trampoline. Real syscall (sysno 81 -- paideia-os design/user/syscall-table.md row 81; kernel dispatcher live at src/kernel/core/syscall/sys_unlink.pdx per R56.M3-005). Arity 2 (path_ptr, path_len_hint), no r10 shuffle. Named to disambiguate from the module's existing pdxfs_unlink STUB, which targets the R42 PdxFS v1 substrate's TXN/parent-inode/basename shape and returns 0 unconditionally. Return: 0 on success, negative errno on failure. Leaf; sysreg for SYSRET rcx/r11 clobber. path_len_hint is a walker CAP (see syscall-table postscript) -- callers pass a real strlen for tightness (upper bound on kernel-side walk).",
+      block: {
+        mov rax, 81;                           // SYS_UNLINK
         syscall;
         ret
       }

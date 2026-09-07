@@ -1,75 +1,98 @@
-// src/rename.pdx -- mv.M1-003 (paideia-os/mv#3)
+// src/rename.pdx -- mv.v1.1-A (retires mv.M1-003 STUB)
 //
-// Rename module: same-directory rename in a single PdxFS TXN (skeleton).
-//
-// =============================================================================
-// SCOPE
-// =============================================================================
-//
-// mv's core operation for the M1 shape: `mv <src> <dst>` where src and
-// dst share a parent directory. The design (design/tooling/r49-r50-
-// plan.md §5.7 M1 line):
-//
-//   First runnable: same-directory rename `mv a b` opens TXN, unlinks
-//   source, links dest, commits.
-//
-// At full ripeness (M2) this is the sequence:
-//
-//   (1) sys_pdxfs_txn_open(mode=PXT_MODE_MODIFY, snap_gen=<cur>)
-//         → fresh KIND_PDXFS_TXN slot in caller's cap_table.
-//   (2) sys_pdxfs_unlink(txn, parent, src_basename)
-//         → source dirent removed inside TXN (not durable until commit).
-//   (3) sys_pdxfs_link(txn, parent, dst_basename, src_inode)
-//         → destination dirent added inside SAME TXN, pointing at the
-//           inode the unlink just released from its old name.
-//   (4) sys_pdxfs_txn_commit(txn)
-//         → drain WAL group; both writes durable atomically.
-//   (5) if -v: print "mv <src> <dst>" to KIND_TTY(write).
-//       if --dry-run: skip steps 1..4 entirely, print the same line.
-//   (6) return 0.
-//
-// M1 ships the SKELETON. It ships the entry-point signature, the
-// argument-gating (src/dst non-null), and the counter dispatch so mv's
-// stats table records every invocation / would-open the way the M2
-// body will. On the happy path it returns MV_RN_STUB (0xFFFFEB20) --
-// the "we validated the args, we would open a TXN and thread an
-// unlink + link through it if the userspace sys_pdxfs_* wrappers
-// existed, but they don't yet" signal.
+// Rename module: same-filesystem atomic rename fast path with
+// byte-copy + unlink fallback on cross-device refusal.
 //
 // =============================================================================
-// WHY STUB IS THE HAPPY PATH AT M1
+// SCOPE (v1.1-A)
 // =============================================================================
 //
-// PdxFS v1 is scheduled at R42 in the paideia-os release table.
-// KIND_PDXFS_FILE (0x195) + KIND_PDXFS_TXN (0x196) have landed as
-// substrate rows (paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx,
-// kind_pdxfs_txn.pdx) -- the kernel can already mint / revoke / query
-// these caps. But the USERSPACE-side syscall wrappers
-// (sys_pdxfs_txn_open, sys_pdxfs_unlink, sys_pdxfs_link,
-// sys_pdxfs_txn_commit) are not yet linked into a mv-facing library.
-// They are being staged by the R42 substrate wave; at HEAD (2026-08-21)
-// mv cannot call them without linking against a symbol that does not
-// yet exist.
+// mv v1.1-A retires the M1-003 STUB (MV_RN_STUB, 0xFFFFEB20) that
+// deferred the rename tail to the R42 PdxFS v1 substrate. Instead
+// the dispatch drops one layer down and consumes the two path-based
+// syscalls that landed with R56.M3-005 in the paideia-os kernel:
 //
-// Faking a rename at M1 would either:
+//   sys_rename(old_ptr, old_len, new_ptr, new_len)  -- sysno 82
+//   sys_unlink(path_ptr, path_len_hint)             -- sysno 81
 //
-//   (a) Mutate the caller's argv strings (defeating mv-is-a-tool -- the
-//       caller's argv is not mv's memory), or
-//   (b) Manufacture an outcome mv did not actually observe (defeating
-//       D3 audit-first at M3, when the audit hook goes live: a mv
-//       that "renamed" without touching the FS lies to its own audit
-//       journal).
+// (rows 82 + 81 in paideia-os design/user/syscall-table.md; live via
+//  the sys_rename.pdx / sys_unlink.pdx dispatchers in
+//  paideia-os src/kernel/core/syscall/). These are strictly weaker
+//  guarantees than the R42 PdxFS TXN dispatch Move::move_dispatch
+//  targets (no WAL group, no atomic multi-dirent commit, no undo
+//  record staged at the syscall layer) -- but for the single-file
+//  mv shape the two operations already guarantee what mv needs:
 //
-// Neither is defensible. The skeleton stops one step short of the
-// substrate boundary and returns MV_RN_STUB. This mirrors the shell
-// LR_STUB / EX_STUB idiom (shell/src/line_reader.pdx, shell/src/
-// exec.pdx) and libpdx-elevate's ELVC_STUB (libpdx-elevate/src/
-// elevate_client.pdx).
+//   * Same-filesystem rename is ATOMIC in the kernel dispatcher
+//     (vfs_rename inside a single lock scope; either the dirent
+//     flip happens or nothing does).
 //
-// M2 replaces the MV_RN_STUB tail with the actual sys_pdxfs_txn_open
-// + sys_pdxfs_unlink + sys_pdxfs_link + sys_pdxfs_txn_commit dispatch.
-// Every consumer already spells rename_same_dir correctly; the M2
-// change is a body edit, not a signature change.
+//   * Cross-device fallback (sys_open + sys_read + sys_write +
+//     sys_close + sys_unlink) is NOT atomic (a crash mid-copy
+//     leaves a partial dst; a crash between the close and the
+//     unlink leaves both src and dst intact). This matches the
+//     POSIX mv-across-filesystems semantics every extant coreutils
+//     mv also ships; the v1.x roadmap will fold the fallback back
+//     under a PdxFS TXN when R42 substrate lands and Move::
+//     move_cross_dev_body absorbs this responsibility.
+//
+// Sequence:
+//
+//   (1) Gate src != 0 and dst != 0 (paranoia; _start already
+//       guarantees this via MvArgv, but a fixture harness calling
+//       Rename::rename_same_dir directly can violate it).
+//   (2) Compute src_len = strlen(src), dst_len = strlen(dst) via
+//       an inline byte-walk. These are the walker CAPs the two
+//       syscalls consume (paideia-os syscall-table postscript
+//       calls out path_len_hint as a cap, not an exact strlen --
+//       so caller's own strlen is both correct AND a tightness
+//       win over passing 0).
+//   (3) sys_rename(src, src_len, dst, dst_len). On 0 -> bump
+//       MV_ST_RENAMES + return 0. Same-filesystem happy path.
+//   (4) On -EXDEV (0xFFFFFFFFFFFFFFEE) -> fall through to
+//       Rename::rn_xdev_copy_unlink(src, dst, src_len). On 0 ->
+//       bump MV_ST_CROSS_DEV + MV_ST_RENAMES + return 0.
+//   (5) On any other negative errno -> bump MV_ST_ERRORS + return
+//       MV_RN_RENAME_FAIL. Any error from the xdev fallback ->
+//       bump MV_ST_ERRORS + return the specific MV_RN_XDEV_* code
+//       stashed via mv_rn_return_code.
+//
+// =============================================================================
+// V1.1-A FLAG SURFACE
+// =============================================================================
+//
+// v1.1-A carries no -i (interactive prompt-on-overwrite), no -n
+// (no-clobber), and no -f (force / no-error-on-nonexistent). The
+// dispatch is unconditional -- if the destination exists the kernel-
+// side sys_rename overwrites it (POSIX default), and if the source
+// does not exist the kernel returns -ENOENT which surfaces as
+// MV_RN_RENAME_FAIL. The three interactive-shape flags land in a
+// later v1.x milestone alongside the -i / -f / -n discussion at
+// paideia-os design/tooling/r49-r50-plan.md §5.7 M3 lines.
+//
+// The existing MvArgv module still parses -v / -i / --dry-run for
+// the Move::move_dispatch path -- Rename::rename_same_dir simply
+// does not consume mv_argv_interactive / mv_argv_dry_run / mv_argv_
+// verbose at v1.1-A. A future harness that routes to Rename instead
+// of Move (single-file same-fs case) will wire the flag consumers
+// then.
+//
+// =============================================================================
+// WHY DIRECT-SYSCALL INSTEAD OF PDXFS TXN
+// =============================================================================
+//
+// The M1-003 skeleton stopped one step short of a substrate boundary
+// that did not exist (R42 PdxFS v1 sys_pdxfs_* wrappers). v1.1-A
+// consumes the substrate that DOES exist today (R56.M3-005 path-based
+// sys_rename + sys_unlink). Manufacturing a rename we did not perform
+// (the M1 STUB's "return MV_RN_STUB and pretend") remains the D3
+// audit-first violation the M1 header documented; v1.1-A's real
+// dispatch discharges that debt. When R42 substrate lands and Move::
+// move_dispatch's TXN-wrapped path becomes universally available,
+// Rename::rename_same_dir either becomes a thin forward to
+// Move::move_dispatch (single-file case) OR keeps the direct-syscall
+// fast path for latency (a TXN-wrapped rename is strictly heavier
+// than a single sys_rename). The v1.x roadmap defers that decision.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
@@ -77,68 +100,367 @@
 //
 //   - Module name PascalCase basename (`Rename`), no directory prefix.
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares are
-//     `cmp r12, 0` (src non-null) and `cmp r13, 0` (dst non-null).
-//   - r11 is scratch; not used in M1 (no .bss reach from this module).
-//   - No byte reads in M1; the `xor rax, rax; mov_b rax, [ptr]`
-//     pattern shows up at M2 for dirent-name reads.
-//   - SysV push/pop parity preserved. Two callee-save pushes (r12 =
-//     src, r13 = dst) + one `sub rsp, 8` for alignment across the
-//     three nested mv_note calls; matched `add rsp, 8` before pop.
-//     Same idiom as shell/src/exec.pdx exec_spawn_and_wait and
-//     libpdx-elevate elevate_client_lookup_broker.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The -EXDEV
+//     compare uses `mov rcx, 0xFFFFFFFFFFFFFFEE; cmp rax, rcx`
+//     (reg-reg pattern) because the imm does not fit imm32 --
+//     same idiom Move::move_dispatch uses at mv_md_link_fail.
+//   - Byte reads in rn_strlen use `xor rax, rax; mov_b rax, [ptr]`
+//     (paideia-as #1248 mitigation; matches argv.pdx flag whitelist).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - SysV push/pop parity:
+//       rename_same_dir     -- 4 callee-save pushes (r12=src,
+//         r13=dst, r14=src_len, r15=dst_len) + sub rsp, 8 for
+//         alignment = 40 bytes. Entry rsp % 16 == 8 + 4 pushes +
+//         8 == rsp % 16 == 0 for nested SysV. Same 4+sub-8 idiom
+//         as MvArgv::mv_argv_parse.
+//       rn_xdev_copy_unlink -- 5 callee-save pushes (rbx=src,
+//         r12=dst, r13=fd_src, r14=fd_dst, r15=n) = 40 bytes;
+//         odd-count push idiom (entry rsp % 16 == 8; 5 pushes
+//         flip parity to == 0). Same idiom as Move::move_cross_
+//         dev_body / cp copy_single_file.
+//       rn_strlen           -- leaf, no callee-save touched.
 
 module Rename = structure {
 
   // ==========================================================================
+  // Storage
+  //
+  // Nine .bss slots that live only for the duration of a single
+  // rename_same_dir call. Same on-stack-in-.bss idiom Move uses --
+  // rsp-relative LEAs vary with prologue depth, so .bss keeps the
+  // addressing straightforward at every call site.
+  //
+  // Single-invocation shape (a mv process runs one dispatch and
+  // exits) means the slots are safe as globals -- no re-entrancy at
+  // v1.1-A.
+  // ==========================================================================
+  pub let MV_RN_XDEV_BUF_LEN     : u64        = 4096
+  pub let mut mv_rn_xdev_buf     : [u8; 4096] = uninit @align(8)
+  pub let mut mv_rn_xdev_fd_src  : u64        = uninit @align(8)
+  pub let mut mv_rn_xdev_fd_dst  : u64        = uninit @align(8)
+  pub let mut mv_rn_xdev_bytes   : u64        = uninit @align(8)
+  pub let mut mv_rn_xdev_src_len : u64        = uninit @align(8)
+  pub let mut mv_rn_return_code  : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // rn_strlen(ptr) -> u64
+  //
+  // Inline strlen over a NUL-terminated user-VA byte string. Leaf
+  // function; walks bytes at [rdi + rcx] until it finds a NUL. The
+  // byte load uses the `xor rax, rax; mov_b rax, [ptr]` pattern from
+  // paideia-as #1248 (also used in argv.pdx's flag whitelist).
+  //
+  // RDI (input): ptr -- pointer to NUL-terminated string
+  // RAX (output): length (bytes, excluding NUL)
+  //
+  // Callee-save discipline: leaf, no push/pop. Clobbers rax, rcx, r11
+  // (rcx is a SysV caller-save; the two callers save it via their
+  // own callee-save discipline). rdi is preserved by convention (we
+  // only index off it).
+  // ==========================================================================
+  pub let rn_strlen : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.v1.1-A: rn_strlen -- inline NUL-terminated string length. Walks bytes at [rdi + rcx] via the `xor rax, rax; mov_b rax, [ptr]` byte-load pattern (paideia-as #1248 mitigation; matches argv.pdx flag whitelist). Leaf function -- no push/pop parity to preserve. Clobbers rax (byte load + return), rcx (loop index), r11 (paideia-as scratch, unused here). rdi is preserved through the loop (we only index off it). `cmp rax, 0` uses imm 0 (fits imm32). Callers in this module preserve rcx via their own callee-save frames. Labels prefixed mv_sl_.",
+      block: {
+        xor rcx, rcx;                        // count = 0
+      mv_sl_loop:
+        xor rax, rax;
+        mov_b rax, [rdi + rcx];              // load byte at ptr[count]
+        cmp rax, 0;
+        je  mv_sl_done;
+        add rcx, 1;
+        jmp mv_sl_loop;
+      mv_sl_done:
+        mov rax, rcx;                        // return count
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rn_xdev_copy_unlink(src, dst, src_len) -> u64
+  //
+  // v1.1-A cross-device fallback. Called by rename_same_dir when
+  // sys_rename returns -EXDEV. Byte-copies through a 4 KiB scratch,
+  // then unlinks the source dirent via sys_unlink.
+  //
+  // RDI (input): src     -- NUL-terminated source path (caller-owned)
+  // RSI (input): dst     -- NUL-terminated destination path (caller-owned)
+  // RDX (input): src_len -- strlen(src), used as walker CAP for sys_unlink
+  // RAX (output): 0 on success; MV_RN_XDEV_* on any error stage.
+  //
+  // Sequence:
+  //   (1) sys_open(src, O_RDONLY = 0)              -> fd_src.
+  //   (2) sys_open(dst, O_WRONLY | O_CREAT = 0x41) -> fd_dst.
+  //   (3) Byte-copy loop through mv_rn_xdev_buf until EOF (n == 0).
+  //       Accumulate bytes into mv_rn_xdev_bytes.
+  //   (4) sys_close(fd_dst); sys_close(fd_src). Return codes ignored --
+  //       fds are released at task teardown regardless.
+  //   (5) sys_unlink(src, src_len). On failure return
+  //       MV_RN_XDEV_UNLINK_FAIL -- destination file was fully written
+  //       (data on new fs is durable at close) but source dirent
+  //       persists; caller sees a dst_ok + src_still_present state.
+  //       This is the same POSIX-mv semantic every extant coreutils
+  //       mv reports.
+  //   (6) Return 0.
+  //
+  // NOT atomic across (2)+(3)+(5) -- see the module header on the
+  // R42 substrate uplift that folds this back under a TXN.
+  //
+  // Register plan:
+  //   rbx = src        (preserved for sys_unlink call)
+  //   r12 = dst        (preserved for post-EOF logic)
+  //   r13 = fd_src     (preserved through the copy loop + close pair)
+  //   r14 = fd_dst     (preserved through the copy loop + close pair)
+  //   r15 = last n     (bytes-read from most recent pdxfs_read;
+  //                    needed as write len and short-write compare)
+  //   src_len stashed to mv_rn_xdev_src_len so r15 stays free for n
+  //   rax = call return / accumulator scratch
+  //   rdi/rsi/rdx = SysV args to nested calls
+  //   r11 = LEA scratch (paideia-as reserved)
+  //
+  // Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15) = 40
+  // bytes. Entry rsp % 16 == 8; 5 pushes flip parity back to 8 then
+  // to 0 (each push flips) -- odd-count push idiom lands rsp % 16
+  // == 0 without needing a sub-rsp pad. Same idiom as cp's
+  // copy_single_file and Move::move_cross_dev_body.
+  // ==========================================================================
+  pub let rn_xdev_copy_unlink : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (src: u64) (dst: u64) (src_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "mv.v1.1-A: rn_xdev_copy_unlink -- cross-device byte-copy + unlink fallback for the sys_rename -EXDEV path. Byte-copies through a 4 KiB scratch (mv_rn_xdev_buf) via real sys_open/read/write/close (Pdxfs::pdxfs_open etc.); on EOF, closes both fds and calls sys_unlink_path on the source. Prologue is 5 callee-save pushes (rbx=src, r12=dst, r13=fd_src, r14=fd_dst, r15=last_n) = 40 bytes; odd-count push idiom lands rsp % 16 == 0 (same idiom as Move::move_cross_dev_body and cp copy_single_file). src_len is stashed to mv_rn_xdev_src_len on entry so r15 stays free for the per-iteration `n`. Six error branches (open_src / open_dst / read / write / short_write / unlink) each close whichever fds are open (0/1/2 depending on where the error hit) and return a distinct MV_RN_XDEV_* code from the 0xFFFFEB28..0xFFFFEB2D band. Short-write detected by `cmp rax, r15; jl` (signed compare -- rax = bytes_written from sys_write, r15 = requested len; jl fires when bytes_written < requested). Negative-errno detection uses `cmp rax, 0; jl` throughout. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 0x40, 0x41, 4096 all fit). r11 scratch for every .bss reach. Effects: !{mem, sysreg} for the syscall clobber shape; @{sched} because the byte-copy syscalls may block on device I/O (no @{cap} because this path opens no fresh capability -- unlike the TXN-wrapped Move path). Labels prefixed mv_rx_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = src
+        mov r12, rsi;                        // r12 = dst
+
+        // Stash src_len to .bss so r15 stays free for the per-iteration `n`.
+        lea r11, [rip + mv_rn_xdev_src_len];
+        mov [r11], rdx;
+
+        // ---- Step 1: open src (O_RDONLY = 0) ---------------------------------
+        mov rdi, rbx;                        // path
+        mov rsi, 0;                          // O_RDONLY
+        call pdxfs_open;
+        cmp rax, 0;
+        jl  mv_rx_open_src_fail;             // negative errno
+
+        mov r13, rax;                        // r13 = fd_src
+        lea r11, [rip + mv_rn_xdev_fd_src];
+        mov [r11], rax;
+
+        // ---- Step 2: open dst (O_WRONLY | O_CREAT = 0x41) --------------------
+        mov rdi, r12;                        // path
+        mov rsi, 0x41;                       // O_WRONLY | O_CREAT
+        call pdxfs_open;
+        cmp rax, 0;
+        jl  mv_rx_open_dst_fail;             // negative errno
+
+        mov r14, rax;                        // r14 = fd_dst
+        lea r11, [rip + mv_rn_xdev_fd_dst];
+        mov [r11], rax;
+
+        // ---- Step 3: read/write loop -----------------------------------------
+      mv_rx_loop:
+        mov rdi, r13;                        // fd_src
+        lea rsi, [rip + mv_rn_xdev_buf];     // buf
+        mov rdx, 4096;                       // MV_RN_XDEV_BUF_LEN
+        call pdxfs_read;
+
+        cmp rax, 0;
+        jl  mv_rx_read_fail;                 // negative errno
+        je  mv_rx_eof;                       // n == 0 -> EOF
+
+        mov r15, rax;                        // r15 = n (bytes read)
+
+        mov rdi, r14;                        // fd_dst
+        lea rsi, [rip + mv_rn_xdev_buf];
+        mov rdx, r15;                        // len = n
+        call pdxfs_write;
+
+        cmp rax, 0;
+        jl  mv_rx_write_fail;                // negative errno
+
+        cmp rax, r15;
+        jl  mv_rx_short_write;               // bytes_written < n
+
+        // Accumulate mv_rn_xdev_bytes += rax.
+        lea r11, [rip + mv_rn_xdev_bytes];
+        mov rcx, [r11];
+        add rcx, rax;
+        mov [r11], rcx;
+
+        jmp mv_rx_loop;
+
+        // ---- Step 4+5: success arm (EOF, close both, unlink src) -------------
+      mv_rx_eof:
+        // Close dst first, then src. Ignore return codes.
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+
+        // Step 5: unlink source dirent via sys_unlink_path.
+        mov rdi, rbx;                        // src
+        lea r11, [rip + mv_rn_xdev_src_len];
+        mov rsi, [r11];                      // path_len_hint = src_len
+        call sys_unlink_path;
+        cmp rax, 0;
+        jne mv_rx_unlink_fail;
+
+        xor rax, rax;                        // MV_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        // ---- Error branches (fds cleaned per-branch) -------------------------
+      mv_rx_open_src_fail:
+        mov rax, 0xFFFFEB28;                 // MV_RN_XDEV_OPEN_SRC_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_rx_open_dst_fail:
+        // fd_src is open; close it.
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB29;                 // MV_RN_XDEV_OPEN_DST_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_rx_read_fail:
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB2A;                 // MV_RN_XDEV_READ_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_rx_write_fail:
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB2B;                 // MV_RN_XDEV_WRITE_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_rx_short_write:
+        mov rdi, r14;
+        call pdxfs_close;
+        mov rdi, r13;
+        call pdxfs_close;
+        mov rax, 0xFFFFEB2C;                 // MV_RN_XDEV_SHORT_WRITE
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_rx_unlink_fail:
+        // Both fds already closed on the success arm; nothing to release.
+        // Destination file is written + closed (data durable on the target
+        // fs) but source dirent persists -- caller sees dst_ok + src_present.
+        mov rax, 0xFFFFEB2D;                 // MV_RN_XDEV_UNLINK_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // rename_same_dir(src, dst) -> u64
   //
-  // Signature: rename_same_dir : (u64, u64) -> u64 !{mem} @{}
-  // RDI (input): src -- pointer to NUL-terminated source path (caller-owned)
-  // RSI (input): dst -- pointer to NUL-terminated destination path (caller-owned)
-  // RAX (output): 0 on success at M2+, MV_RN_STUB on the M1 happy path,
-  //               or one of the MV_RN_* codes on error.
+  // v1.1-A dispatcher. Tries sys_rename (sysno 82) first for the
+  // same-filesystem atomic fast path; on -EXDEV, falls through to
+  // rn_xdev_copy_unlink.
   //
-  // M1 semantics (skeleton):
-  //   src == 0             -> MV_RN_BAD_SRC
-  //   dst == 0             -> MV_RN_BAD_DST
-  //   otherwise            -> MV_RN_STUB
+  // Signature: rename_same_dir : (u64, u64) -> u64 !{mem, sysreg} @{sched}
+  // RDI (input): src -- NUL-terminated source path (caller-owned)
+  // RSI (input): dst -- NUL-terminated destination path (caller-owned)
+  // RAX (output): 0 on success; MV_RN_BAD_SRC / MV_RN_BAD_DST on argv
+  //               gate reject; MV_RN_RENAME_FAIL on sys_rename hard-fail;
+  //               MV_RN_XDEV_* on cross-device fallback failure.
   //
   // Counter dispatch:
   //   Every entry bumps MV_ST_INVOCATIONS.
-  //   The would-open happy path bumps MV_ST_TXN_OPENS (so the counter
-  //   records the intent to open a TXN even at M1; M2 keeps the same
-  //   bump semantics and additionally bumps MV_ST_TXN_COMMITS on a
-  //   successful commit).
+  //   Same-filesystem rename success bumps MV_ST_RENAMES (== slot 1;
+  //     the MV_ST_MOVES alias).
+  //   Cross-device fallback success bumps MV_ST_CROSS_DEV +
+  //     MV_ST_RENAMES.
   //   Any reject path bumps MV_ST_ERRORS.
+  //
+  //   The v1.1-A path does NOT bump MV_ST_TXN_OPENS / MV_ST_TXN_
+  //   COMMITS -- no PdxFS TXN is opened. Move::move_dispatch retains
+  //   the TXN counters for the R42-substrate-gated general-mv path.
   //
   // Register plan:
   //   r12 = src         (callee-save; preserved through mv_note calls)
   //   r13 = dst         (callee-save; preserved through mv_note calls)
-  //   rdi = which       (bumped between calls)
-  //   rax = return value
+  //   r14 = src_len     (callee-save; preserved through sys_rename call)
+  //   r15 = dst_len     (callee-save; preserved through sys_rename call)
+  //   rax = call return / bump-arg scratch
+  //   rcx = -EXDEV compare register (movabs)
+  //   rdi/rsi/rdx = SysV args to nested calls
+  //   r11 = LEA scratch (paideia-as reserved)
   //
-  // Prologue: two callee-save pushes + `sub rsp, 8` = 24 bytes. Entry
-  // rsp % 16 == 8, so 8 - 24 % 16 == 0. Post-prologue rsp % 16 == 0
-  // for the nested mv_note calls (SysV alignment). Matched epilogue.
+  // Prologue: 4 callee-save pushes (r12..r15) + sub rsp, 8 = 40
+  // bytes. Post-prologue rsp % 16 == 0 for the nested SysV calls.
+  // Same idiom as MvArgv::mv_argv_parse (4 pushes + sub 8). Matching
+  // epilogue at every ret path.
+  //
+  // The -EXDEV compare stages through rcx because 0xFFFFFFFFFFFFFFEE
+  // does not fit in imm32 (paideia-as `cmp rax, imm32` sign-extends,
+  // yielding a different 64-bit value than the movabs). Same
+  // reg-reg pattern Move::move_dispatch uses at mv_md_link_fail.
   // ==========================================================================
-  pub let rename_same_dir : (u64, u64) -> u64 !{mem} @{} =
+  pub let rename_same_dir : (u64, u64) -> u64 !{mem, sysreg} @{sched} =
     fn (src: u64) (dst: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "mv.M1-003 (#3): the same-directory rename skeleton. Two callee-save pushes (r12=src, r13=dst) preserve the args across the nested mv_note calls at INVOCATIONS / TXN_OPENS / ERRORS so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the nested SysV call, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx) and the shell exec_spawn_and_wait skeleton (shell/src/exec.pdx). The src == 0 / dst == 0 gates use `cmp reg, 0` (paideia-as no-test-mnemonic discipline; imm 0 fits imm32 window). MV_RN_STUB (0xFFFFEB20) is the M1 happy-path sentinel -- the userspace sys_pdxfs_txn_open / sys_pdxfs_unlink / sys_pdxfs_link / sys_pdxfs_txn_commit wrappers are not yet in the tree (R42 substrate wave in progress; KIND_PDXFS_FILE/TXN rows land at paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx and kind_pdxfs_txn.pdx). Manufacturing a rename we did not actually perform would defeat the D3 audit-first invariant M3 formalises (see design/architecture.md §4.2). M2 replaces the MV_RN_STUB tail with the real sys_pdxfs_* dispatch; the return-code transitions from 0xFFFFEB20 -> 0 on the happy path. Labels prefixed mv_rn_.",
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "mv.v1.1-A: rename_same_dir -- direct sys_rename dispatcher with sys_open/read/write/unlink fallback on -EXDEV. Retires the M1-003 STUB (MV_RN_STUB, 0xFFFFEB20) that deferred the tail to the R42 PdxFS v1 substrate. Prologue is 4 callee-save pushes (r12=src, r13=dst, r14=src_len, r15=dst_len) + sub rsp, 8 = 40 bytes; entry rsp % 16 == 8 + 40 lands rsp % 16 == 0 for the nested SysV calls (same idiom MvArgv::mv_argv_parse uses). Bump discipline: MV_ST_INVOCATIONS on entry, MV_ST_RENAMES (== MV_ST_MOVES slot 1 alias) on success, MV_ST_CROSS_DEV on -EXDEV fallback success, MV_ST_ERRORS on any reject. Argv-gate rejects (src == 0, dst == 0) bump MV_ST_ERRORS and return MV_RN_BAD_SRC / MV_RN_BAD_DST -- unchanged from the M1-003 skeleton. sys_rename call: mov rdi, r12; mov rsi, r14; mov rdx, r13; mov rcx, r15; call sys_rename; the trampoline does the SysV-rcx-to-syscall-r10 shuffle. -EXDEV compare uses `mov rcx, 0xFFFFFFFFFFFFFFEE; cmp rax, rcx` (reg-reg pattern; imm does not fit imm32 -- same idiom Move::move_dispatch uses at mv_md_link_fail). Fallback path bumps MV_ST_CROSS_DEV via mv_note BEFORE calling rn_xdev_copy_unlink (descriptive stat; a body-side abort still records the intent to fall back). On xdev fallback failure, the specific MV_RN_XDEV_* code from rn_xdev_copy_unlink is stashed to mv_rn_return_code across the mv_note calls (nested calls clobber rax) and restored before return. Effects match the callee shape: !{mem, sysreg} for syscall clobber; @{sched} because sys_rename / sys_open+read+write+close may block on device I/O; no @{cap} because no capability is minted. Labels prefixed mv_rn_.",
       block: {
+        // ---- Prologue --------------------------------------------------------
         push r12;
         push r13;
-        sub rsp, 8;                          // align rsp % 16 for mv_note
+        push r14;
+        push r15;
+        sub rsp, 8;                          // align rsp % 16 == 0
 
-        mov r12, rdi;                        // src
-        mov r13, rsi;                        // dst
+        mov r12, rdi;                        // r12 = src
+        mov r13, rsi;                        // r13 = dst
 
         // Bump MV_ST_INVOCATIONS unconditionally so the counter records
         // every ATTEMPT, not every success -- the failed-arg case is
         // still an invocation the shell wants to see in its stats.
-        // (Same discipline as shell/src/line_reader.pdx's SH_ST_PROMPTS
-        // bump.)
         mov rdi, 0;                          // MV_ST_INVOCATIONS
         call mv_note;
 
@@ -150,17 +472,58 @@ module Rename = structure {
         cmp r13, 0;
         je  mv_rn_bad_dst;
 
-        // Would-open the TXN. Bump MV_ST_TXN_OPENS so the counter
-        // records the intent even at M1; M2 keeps the same bump when
-        // the sys_pdxfs_txn_open call actually issues.
-        mov rdi, 2;                          // MV_ST_TXN_OPENS
+        // ---- Compute strlens (walker CAPs for the two syscalls) --------------
+        mov rdi, r12;                        // src
+        call rn_strlen;
+        mov r14, rax;                        // r14 = src_len
+
+        mov rdi, r13;                        // dst
+        call rn_strlen;
+        mov r15, rax;                        // r15 = dst_len
+
+        // ---- Step 1: sys_rename (same-filesystem fast path) ------------------
+        mov rdi, r12;                        // old_ptr = src
+        mov rsi, r14;                        // old_len = src_len
+        mov rdx, r13;                        // new_ptr = dst
+        mov rcx, r15;                        // new_len = dst_len (SysV -> syscall r10 shuffled inside sys_rename)
+        call sys_rename;
+
+        cmp rax, 0;
+        je  mv_rn_success;                   // fast path succeeded
+
+        // sys_rename returned non-zero. Is it -EXDEV? (v1.1-A fallback.)
+        // 0xFFFFFFFFFFFFFFEE (-18) does not fit imm32, stage via rcx.
+        mov rcx, 0xFFFFFFFFFFFFFFEE;
+        cmp rax, rcx;
+        jne mv_rn_rename_fail;               // some other errno -> hard fail
+
+        // ---- Step 2: -EXDEV fallback -----------------------------------------
+        // Bump MV_ST_CROSS_DEV BEFORE the fallback call so a body-side
+        // failure still records the fall-back intent (descriptive stat).
+        mov rdi, 7;                          // MV_ST_CROSS_DEV
         call mv_note;
 
-        // M1 happy path: MV_RN_STUB. M2 replaces this tail with the
-        // real sys_pdxfs_txn_open + sys_pdxfs_unlink + sys_pdxfs_link
-        // + sys_pdxfs_txn_commit dispatch and returns 0 on success.
-        mov rax, 0xFFFFEB20;                 // MV_RN_STUB
+        // rn_xdev_copy_unlink(src=r12, dst=r13, src_len=r14).
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        call rn_xdev_copy_unlink;
+        cmp rax, 0;
+        jne mv_rn_xdev_fail;                 // fallback returned a MV_RN_XDEV_* code
+
+        // Fallback succeeded -- fall through to success arm.
+        // (MV_ST_CROSS_DEV was bumped above; success arm bumps MV_ST_RENAMES.)
+
+      mv_rn_success:
+        // Bump MV_ST_RENAMES (== MV_ST_MOVES slot 1 alias) on both the
+        // same-fs fast path AND the -EXDEV fallback success.
+        mov rdi, 1;                          // MV_ST_RENAMES
+        call mv_note;
+
+        xor rax, rax;                        // MV_OK
         add rsp, 8;
+        pop r15;
+        pop r14;
         pop r13;
         pop r12;
         ret;
@@ -170,6 +533,8 @@ module Rename = structure {
         call mv_note;
         mov rax, 0xFFFFEB21;                 // MV_RN_BAD_SRC
         add rsp, 8;
+        pop r15;
+        pop r14;
         pop r13;
         pop r12;
         ret;
@@ -179,6 +544,40 @@ module Rename = structure {
         call mv_note;
         mov rax, 0xFFFFEB22;                 // MV_RN_BAD_DST
         add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_rn_rename_fail:
+        // sys_rename returned a negative errno other than -EXDEV
+        // (typical: -ENOENT for missing src, -EACCES for permission,
+        // -EFAULT for a bad user pointer). Bump ERRORS + return the
+        // v1.1-A hard-fail sentinel.
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        mov rax, 0xFFFFEB27;                 // MV_RN_RENAME_FAIL
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      mv_rn_xdev_fail:
+        // rn_xdev_copy_unlink returned a specific MV_RN_XDEV_* code
+        // in rax. Stash it in .bss so it survives the mv_note call
+        // (nested calls clobber rax).
+        lea r11, [rip + mv_rn_return_code];
+        mov [r11], rax;
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+        lea r11, [rip + mv_rn_return_code];
+        mov rax, [r11];                      // restore MV_RN_XDEV_*
+        add rsp, 8;
+        pop r15;
+        pop r14;
         pop r13;
         pop r12;
         ret

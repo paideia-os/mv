@@ -39,7 +39,13 @@
 //   (a) Argv gates on Rename::rename_same_dir with null pointers.
 //       rename_same_dir(0, dst) returns MV_RN_BAD_SRC (0xFFFFEB21);
 //       rename_same_dir(src, 0) returns MV_RN_BAD_DST (0xFFFFEB22).
-//       Both bump MV_ST_ERRORS. Neither reaches the TXN layer.
+//       Both bump MV_ST_ERRORS. Neither reaches the syscall layer.
+//       (The pre-v1.1-A third sub-vector -- rename_same_dir(src, dst)
+//       returning MV_RN_STUB -- is retired: v1.1-A dispatches real
+//       sys_rename which would try to walk the caller-supplied
+//       pointers via rn_strlen, faulting on the 0x1000/0x2000
+//       fixture pointers this file uses. A live rename smoke lives
+//       in the QEMU harness runbook (tests/README.md) instead.)
 //
 //   (b) Direct pdxfs_txn_abort invocation. Pdxfs::pdxfs_txn_abort
 //       is an M2 STUB returning 0 (success). This verifies the
@@ -81,7 +87,7 @@
 //   0xFFFFEBC0 MV_TEST_ABT_OK            all-pass sentinel (== 0)
 //   0xFFFFEBC1 MV_TEST_ABT_BAD_SRC_RC    rename_same_dir(0,dst) != MV_RN_BAD_SRC
 //   0xFFFFEBC2 MV_TEST_ABT_BAD_DST_RC    rename_same_dir(src,0) != MV_RN_BAD_DST
-//   0xFFFFEBC3 MV_TEST_ABT_STUB_RC       rename_same_dir(src,dst) != MV_RN_STUB
+//   0xFFFFEBC3 MV_TEST_ABT_STUB_RC       RETIRED at v1.1-A (STUB path removed)
 //   0xFFFFEBC4 MV_TEST_ABT_ERR_STAT      MV_ST_ERRORS did not bump on reject
 //   0xFFFFEBC5 MV_TEST_ABT_ABT_STUB      pdxfs_txn_abort(1) != 0 (stub broke)
 //   0xFFFFEBC6 MV_TEST_ABT_HAPPY_RC      move_dispatch(src,dst) != 0
@@ -126,7 +132,9 @@ module TestTxnAbort = structure {
   //   Block A: Rename argv-gate rejects (reachable failure paths).
   //     - rename_same_dir(0, 0x2000) -> MV_RN_BAD_SRC; MV_ST_ERRORS++.
   //     - rename_same_dir(0x1000, 0) -> MV_RN_BAD_DST; MV_ST_ERRORS++.
-  //     - rename_same_dir(0x1000, 0x2000) -> MV_RN_STUB.
+  //     (Pre-v1.1-A A.3 -- rename_same_dir(0x1000, 0x2000) -> MV_RN_STUB
+  //     -- is retired: v1.1-A now dispatches real sys_rename which
+  //     would walk the fixture pointers.)
   //
   //   Block B: pdxfs_txn_abort trampoline shape.
   //     - pdxfs_txn_abort(1) -> 0 (M2 STUB OK).
@@ -177,16 +185,12 @@ module TestTxnAbort = structure {
         cmp rax, rcx;
         jne mv_tta_bad_dst_rc;
 
-        // A.3: rename_same_dir(0x1000, 0x2000) -> MV_RN_STUB (0xFFFFEB20).
-        // (Rename layer is still the M1 skeleton; happy path returns the STUB
-        //  sentinel until R42 substrate flips it to 0. Verifying we still see
-        //  the sentinel catches an inadvertent flip that outruns the substrate.)
-        mov rdi, 0x1000;
-        mov rsi, 0x2000;
-        call rename_same_dir;
-        mov rcx, 0xFFFFEB20;                     // MV_RN_STUB
-        cmp rax, rcx;
-        jne mv_tta_stub_rc;
+        // A.3 RETIRED at v1.1-A: rename_same_dir(0x1000, 0x2000) used to
+        // return MV_RN_STUB (0xFFFFEB20). v1.1-A retired the STUB and
+        // dispatches real sys_rename, which begins by strlen-walking the
+        // caller pointers -- 0x1000/0x2000 fixture pointers would fault
+        // in-process before reaching the syscall. A live rename smoke
+        // lives in the QEMU harness runbook (tests/README.md) instead.
 
         // Verify MV_ST_ERRORS >= 2 (two reject paths bumped it).
         mov rdi, 5;                              // MV_ST_ERRORS
@@ -266,13 +270,6 @@ module TestTxnAbort = structure {
 
       mv_tta_bad_dst_rc:
         mov rax, 0xFFFFEBC2;                     // MV_TEST_ABT_BAD_DST_RC
-        add rsp, 8;
-        pop r12;
-        pop rbx;
-        ret;
-
-      mv_tta_stub_rc:
-        mov rax, 0xFFFFEBC3;                     // MV_TEST_ABT_STUB_RC
         add rsp, 8;
         pop r12;
         pop rbx;

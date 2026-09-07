@@ -9,6 +9,31 @@ and the issues each entry closes.
 
 ## Unreleased (Enhancement v1.x)
 
+- `mv.v1.1-A`: retired the M1-003 `MV_RN_STUB` (0xFFFFEB20) that
+  deferred `Rename::rename_same_dir` (`src/rename.pdx`) to the
+  R42 PdxFS v1 substrate. The rename dispatcher now consumes the
+  path-based syscalls that landed with R56.M3-005 in paideia-os
+  (`sys_rename` sysno 82, `sys_unlink` sysno 81 -- rows 82 + 81
+  in `design/user/syscall-table.md`): tries `sys_rename` first
+  for the same-filesystem atomic fast path, and on -EXDEV falls
+  through to a 4 KiB byte-copy scratch + `sys_close` + `sys_unlink`
+  fallback. New `Rename::rn_strlen` walker sizes the caller's
+  paths for the walker-CAP field the two syscalls consume. New
+  `Rename::rn_xdev_copy_unlink` body owns the fallback (mirrors
+  `Move::move_cross_dev_body`'s shape but without the outer TXN
+  wrap -- the v1.1-A single-file mv path takes the strictly
+  weaker no-TXN guarantee documented in the module header).
+  New error codes `MV_RN_RENAME_FAIL` / `MV_RN_XDEV_OPEN_SRC_FAIL`
+  / `_OPEN_DST_FAIL` / `_READ_FAIL` / `_WRITE_FAIL` / `_SHORT_WRITE`
+  / `_UNLINK_FAIL` in the 0xFFFFEB27..0xFFFFEB2D slice. New
+  `Pdxfs::sys_rename` + `Pdxfs::sys_unlink_path` trampolines
+  (arity-4 and arity-2; the arity-4 uses the same SysV-rcx-to-
+  syscall-r10 shuffle `pdxfs_link` uses). v1.1-A carries no
+  `-i` / `-n` / `-f` flags -- the dispatch is unconditional; the
+  three flags land in a later v1.x milestone. `tests/test_txn_
+  abort.pdx` block A.3 (which asserted the retired STUB return)
+  is dropped from the fixture; its slot in the return-code band
+  (`MV_TEST_ABT_STUB_RC`, 0xFFFFEBC3) stays reserved.
 - `mv.ENH-001` (#17): fixed a stack-frame corruption in
   `Move::move_dispatch`'s commit-fail epilogue (`src/move.pdx`) --
   a stray `add rsp, 8` broke the 5-push/5-pop parity, corrupting
