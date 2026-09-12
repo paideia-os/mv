@@ -38,6 +38,17 @@
 // MV_ST_TXN_ABORTS, and returns a distinct MV_MV_* code so a
 // downstream test can identify which stage failed.
 //
+// mv.ENH-004 (paideia-os/mv#20) inserts a NEW step between (3) and
+// (4) -- the destination-clobber guard. Pdxfs::pdxfs_dst_exists is
+// called with dst_ptr; if the destination is present and the caller
+// did not pass -f / --force, the move is refused with MV_MV_DST_
+// EXISTS BEFORE any TXN is opened. Source dirent stays intact and
+// dst is byte-identical to its prior contents (the "unrecoverable
+// clobbered inode" gap the audit design otherwise leaves open --
+// see the file-header rationale in src/undo.pdx). The refused
+// MoveRecord is still populated + emitted with dst_existed = 1 so
+// the semantic-pipe consumer sees the refused intent.
+//
 // =============================================================================
 // SAME-DIR VS CROSS-DIR
 // =============================================================================
@@ -140,6 +151,28 @@ module Move = structure {
   // semantic-pipe field at M3.
   pub let mut mv_move_was_cross_user : u64 = uninit @align(8)
 
+  // -- ENH-004 dst_existed flag (paideia-os/mv#20) ---------------------------
+  //
+  // Set to 1 by move_dispatch when Pdxfs::pdxfs_dst_exists reports the
+  // destination path already exists at probe time. The value is
+  // consumed by:
+  //
+  //   (a) The refuse-vs-overwrite branch itself (no -f => refuse with
+  //       MV_MV_DST_EXISTS; -f => proceed and let the existing link
+  //       overwrite semantics apply).
+  //
+  //   (b) Schema::mv_schema_populate, which mirrors this into the
+  //       MoveRecord.dst_existed field (offset 80, schema v2) so a
+  //       downstream semantic-pipe consumer can distinguish a fresh-
+  //       create move (dst_existed = 0) from a clobber-consented
+  //       overwrite (dst_existed = 1, -f granted) or a refused
+  //       clobber (dst_existed = 1, MV_MV_DST_EXISTS returned).
+  //
+  // Cleared in move_reset. NOT reset to 0 on the -f overwrite path
+  // (the value is descriptive, not consequential -- an -f overwrite
+  // still carried a pre-existing dst; the record documents that).
+  pub let mut mv_move_dst_existed : u64 = uninit @align(8)
+
   // -- Return-code stash slot -----------------------------------------------
   //
   // move_dispatch uses this to preserve the specific MV_MV_XDEV_*
@@ -159,7 +192,7 @@ module Move = structure {
   pub let move_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M2-001 (#4) + mv.M2-002 (#5): zero the move-local .bss slots so move_dispatch starts empty. Same idiom as mv_argv_reset (src/argv.pdx) and cp's CopyFile::copy_reset (paideia-os/cp src/copy.pdx). xor rax,rax; ten lea+mov pairs (six M2-001 slots + four M2-002 slots including was_cross_device). Leaf function -- no push/pop parity. r11 is scratch (paideia-as conformance).",
+      justification: "mv.M2-001 (#4) + mv.M2-002 (#5) + mv.ENH-004 (#20): zero the move-local .bss slots so move_dispatch starts empty (ENH-004 widened the reset from eleven to twelve slots for mv_move_dst_existed). Same idiom as mv_argv_reset (src/argv.pdx) and cp's CopyFile::copy_reset (paideia-os/cp src/copy.pdx). xor rax,rax; twelve lea+mov pairs (six M2-001 slots + five M2-002/004 slots + one ENH-004 slot). Leaf function -- no push/pop parity. r11 is scratch (paideia-as conformance).",
       block: {
         xor rax, rax;
         lea r11, [rip + mv_move_src_parent];        mov [r11], rax;
@@ -173,6 +206,129 @@ module Move = structure {
         lea r11, [rip + mv_move_xdev_bytes];        mov [r11], rax;
         lea r11, [rip + mv_move_was_cross_device];  mov [r11], rax;
         lea r11, [rip + mv_move_was_cross_user];    mov [r11], rax;
+        lea r11, [rip + mv_move_dst_existed];       mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ENH-004 (#20) dst-exists refusal diagnostic strings
+  //
+  // The refusal message follows the POSIX-mv precedent (`cannot move '<src>'
+  // to '<dst>': ...`) with a paideia-os-specific hint about the -f
+  // overwrite flag. The message is emitted as five sys_writes to fd 2
+  // (stderr):
+  //
+  //   part A: "mv: cannot move '"
+  //   part B: <src path bytes>            (variable, from rn_strlen)
+  //   part C: "' to '"
+  //   part D: <dst path bytes>            (variable, from rn_strlen)
+  //   part E: "': destination exists (use -f to overwrite)\n"
+  //
+  // Kept as three static byte arrays; the two variable-length parts
+  // reuse Rename::rn_strlen (paideia-as resolves the unqualified name
+  // across modules -- same convention argv.pdx uses for libpdx-argv's
+  // parse_argv / reset). The message is best-effort; a fd-2 write
+  // refusal does not change the refuse-vs-proceed decision the guard
+  // has already made.
+  // ==========================================================================
+  pub let MV_DE_MSG_A : [u8; 17] = "mv: cannot move '"
+  pub let MV_DE_MSG_A_LEN : u64  = 17
+
+  pub let MV_DE_MSG_C : [u8; 6]  = "' to '"
+  pub let MV_DE_MSG_C_LEN : u64  = 6
+
+  pub let MV_DE_MSG_E : [u8; 44] =
+    "': destination exists (use -f to overwrite)\n"
+  pub let MV_DE_MSG_E_LEN : u64  = 44
+
+  // ==========================================================================
+  // mv_dst_exists_diag(src_ptr, dst_ptr) -> u64
+  //
+  // Emit the destination-clobber refusal diagnostic to stderr (fd 2).
+  // Called from move_dispatch's mv_md_dst_exists_refuse branch.
+  //
+  // RDI (input): src_ptr -- NUL-terminated source path
+  // RSI (input): dst_ptr -- NUL-terminated destination path
+  // RAX (output): 0 always (best-effort emission).
+  //
+  // Sequence: five nested SysV calls in order --
+  //   (1) pdxfs_write(2, &MV_DE_MSG_A, 17)
+  //   (2) rn_strlen(src) -> len; pdxfs_write(2, src, len)
+  //   (3) pdxfs_write(2, &MV_DE_MSG_C, 6)
+  //   (4) rn_strlen(dst) -> len; pdxfs_write(2, dst, len)
+  //   (5) pdxfs_write(2, &MV_DE_MSG_E, 44)
+  //
+  // Register plan (nested SysV calls):
+  //   rbx = src_ptr (preserved across write / strlen calls)
+  //   r12 = dst_ptr (preserved across write / strlen calls)
+  //   rax = call return scratch
+  //   rdi/rsi/rdx = SysV args to nested calls
+  //   r11 = LEA scratch (paideia-as reserved; unused here -- static
+  //         message pointers are addressed via `lea rsi, [rip + sym]`
+  //         which uses rsi directly).
+  //
+  // Prologue: 2 callee-save pushes (rbx, r12) + sub rsp, 8 = 24 bytes;
+  // entry rsp % 16 == 8, 2 pushes flip parity to 8, sub 8 lands
+  // rsp % 16 == 0 for the nested SysV calls. Same 2+sub-8 idiom as
+  // MvArgv::mv_argv_parse's 4+sub-8 (this one uses two pushes because
+  // rbx/r12 suffice; no per-iteration cursor state needed). Matched
+  // epilogue on the single ret path.
+  // ==========================================================================
+  pub let mv_dst_exists_diag : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.ENH-004 (#20): mv_dst_exists_diag -- destination-clobber refusal message emitter. Five sys_write calls to fd 2 with three static byte-array parts (MV_DE_MSG_A / _C / _E) and two variable-length path bodies whose lengths come from Rename::rn_strlen (unqualified linker resolution across modules; same convention argv.pdx uses for libpdx-argv symbols). Prologue is 2 callee-save pushes (rbx=src_ptr, r12=dst_ptr) + sub rsp, 8 = 24 bytes; entry rsp % 16 == 8, 2 pushes + sub 8 lands rsp % 16 == 0 for the SysV calls. Matched epilogue on the single ret path. Return 0 always -- best-effort per D3 audit-first: the refuse decision is already committed by the caller, so a fd-2 write refusal cannot invalidate it. Every `cmp reg, imm` cap-safe (no compares in this function). r11 unused (all static message pointers are LEA'd directly into rsi). Labels prefixed mv_ded_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+        push r12;
+        sub rsp, 8;                              // align rsp % 16 == 0
+
+        mov rbx, rdi;                            // rbx = src_ptr
+        mov r12, rsi;                            // r12 = dst_ptr
+
+        // ---- Part A: "mv: cannot move '" -------------------------------------
+        mov rdi, 2;                              // stderr
+        lea rsi, [rip + MV_DE_MSG_A];
+        mov rdx, 17;                             // MV_DE_MSG_A_LEN
+        call pdxfs_write;
+
+        // ---- Part B: <src path bytes> ----------------------------------------
+        mov rdi, rbx;                            // src_ptr
+        call rn_strlen;                          // -> rax = len(src)
+        mov rdx, rax;                            // len for the write
+
+        mov rdi, 2;                              // stderr
+        mov rsi, rbx;                            // src_ptr
+        call pdxfs_write;
+
+        // ---- Part C: "' to '" ------------------------------------------------
+        mov rdi, 2;
+        lea rsi, [rip + MV_DE_MSG_C];
+        mov rdx, 6;                              // MV_DE_MSG_C_LEN
+        call pdxfs_write;
+
+        // ---- Part D: <dst path bytes> ----------------------------------------
+        mov rdi, r12;                            // dst_ptr
+        call rn_strlen;                          // -> rax = len(dst)
+        mov rdx, rax;
+
+        mov rdi, 2;
+        mov rsi, r12;                            // dst_ptr
+        call pdxfs_write;
+
+        // ---- Part E: "': destination exists (use -f to overwrite)\n" --------
+        mov rdi, 2;
+        lea rsi, [rip + MV_DE_MSG_E];
+        mov rdx, 44;                             // MV_DE_MSG_E_LEN
+        call pdxfs_write;
+
+        // ---- Epilogue --------------------------------------------------------
+        xor rax, rax;                            // return 0 (best-effort)
+        add rsp, 8;
+        pop r12;
+        pop rbx;
         ret
       }
     }
@@ -484,6 +640,62 @@ module Move = structure {
         lea r11, [rip + mv_move_src_inode];
         mov [r11], rax;
 
+        // ---- mv.ENH-004 (#20): destination-clobber guard ---------------------
+        //
+        // Probe the destination path via Pdxfs::pdxfs_dst_exists (M2
+        // STUB returns 0; R42 body-swap uses sys_stat). Three outcomes:
+        //
+        //   probe == 0 (does not exist)        -> proceed (mv_move_dst_
+        //                                          existed stays 0).
+        //   probe  > 0 && mv_argv_force == 0    -> refuse: emit stderr
+        //                                          diagnostic, populate
+        //                                          + emit MoveRecord
+        //                                          with dst_existed = 1,
+        //                                          bump ERRORS + DEST_
+        //                                          REFUSED, return
+        //                                          MV_MV_DST_EXISTS.
+        //                                          No TXN is opened;
+        //                                          source dirent stays
+        //                                          intact and dst is
+        //                                          byte-identical.
+        //   probe  > 0 && mv_argv_force == 1    -> set mv_move_dst_
+        //                                          existed = 1 and
+        //                                          proceed to the TXN
+        //                                          path (link semantics
+        //                                          handle the overwrite).
+        //   probe  < 0 (errno)                  -> conservative fall-
+        //                                          through as does-not-
+        //                                          exist so unrelated
+        //                                          stat errors do not
+        //                                          block the move.
+        //
+        // The refuse-emit sequence populates + emits the MoveRecord
+        // even though no TXN was opened -- downstream semantic-pipe
+        // consumers see the intent + refusal in one record (D3 audit-
+        // first shape for a refused destructive op).
+        mov rdi, r12;                            // dst_ptr
+        call pdxfs_dst_exists;
+        cmp rax, 0;
+        jle mv_md_dst_absent;                    // 0 or negative -> proceed
+
+        // Destination exists -- set the flag first so the MoveRecord
+        // reflects it whether we refuse or overwrite.
+        mov rax, 1;
+        lea r11, [rip + mv_move_dst_existed];
+        mov [r11], rax;
+
+        // Consult the force flag.
+        lea r11, [rip + mv_argv_force];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mv_md_dst_absent;                    // -f granted -> proceed
+
+        // No -f: refuse. Fall into the refuse-emit branch below the
+        // dry-run gate (single-owner MoveRecord emit + return path).
+        jmp mv_md_dst_exists_refuse;
+
+      mv_md_dst_absent:
+
         // ---- mv.ENH-007 (#23): --dry-run gate ---------------------------------
         // Everything above this point is "parse + validate + resolve
         // parents" (doc/mv.pdxdoc §OPTIONS --dry-run contract). If the
@@ -792,6 +1004,37 @@ module Move = structure {
         call mv_note;
         lea r11, [rip + mv_move_return_code];
         mov rax, [r11];                      // restore MV_AUD_*
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mv_md_dst_exists_refuse:
+        // mv.ENH-004 (#20): destination-clobber refuse. No TXN was
+        // opened -- nothing to abort. Emit stderr diagnostic, then
+        // populate + emit the MoveRecord (dst_existed = 1) so a
+        // semantic-pipe consumer sees the refused intent. Bump
+        // MV_ST_DEST_REFUSED + MV_ST_ERRORS, return MV_MV_DST_EXISTS.
+        mov rdi, rbx;                        // src_ptr
+        mov rsi, r12;                        // dst_ptr
+        call mv_dst_exists_diag;
+
+        // Populate + emit MoveRecord (D3 audit-first shape for the
+        // refused op).
+        call mv_schema_reset;
+        mov rdi, rbx;                        // src_ptr
+        mov rsi, r12;                        // dst_ptr
+        call mv_schema_populate;
+        call mv_schema_emit;
+
+        mov rdi, 16;                         // MV_ST_DEST_REFUSED
+        call mv_note;
+        mov rdi, 5;                          // MV_ST_ERRORS
+        call mv_note;
+
+        mov rax, 0xFFFFEB3E;                 // MV_MV_DST_EXISTS
         pop r15;
         pop r14;
         pop r13;

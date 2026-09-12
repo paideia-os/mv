@@ -1,0 +1,337 @@
+// tests/test_dst_exists.pdx -- mv.ENH-004 (paideia-os/mv#20)
+//
+// TestDstExists module: destination-clobber guard + MoveRecord.dst_existed
+// witness.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv.ENH-004 lands a destination-clobber guard in Move::move_dispatch
+// (src/move.pdx) that refuses a mv when the destination path already
+// exists and the caller did not pass -f / --force. The guard side-
+// effects:
+//
+//   * Pdxfs::pdxfs_dst_exists is probed with dst_ptr BEFORE any TXN
+//     is opened. Return > 0 (exists) triggers the guard branch;
+//     0 or negative (does-not-exist / errno) proceeds to the TXN
+//     path unchanged.
+//
+//   * The Move::mv_move_dst_existed .bss slot is set to 1 whenever
+//     the probe reports the destination present, both on the refuse
+//     branch AND on the -f-consented overwrite branch (descriptive
+//     flag; downstream consumers use the record to distinguish a
+//     fresh-create move from a clobber-consented one).
+//
+//   * Schema::mv_move_record is widened to 88 bytes (schema v2,
+//     magic 0xFFFFEB5000000002) with dst_existed at offset 80.
+//
+//   * MvArgv::mv_argv_force is a new .bss slot populated by
+//     mv_argv_parse on `-f` / `--force`. mv.ENH-004 (#20) also widens
+//     mv_argv_reset from six to seven zeroed slots.
+//
+//   * Mv::MV_MV_DST_EXISTS (0xFFFFEB3E) is the return code the
+//     refuse branch emits; Mv::MV_ST_DEST_REFUSED (slot 16) is the
+//     counter it bumps.
+//
+// =============================================================================
+// SUBSTRATE STATE + WITNESS SHAPE
+// =============================================================================
+//
+// At HEAD (2026-09-12) Pdxfs::pdxfs_dst_exists is an M2 STUB that
+// returns 0 (destination does not exist) so the M4 stub-driven
+// fixtures (test_smoke, test_txn_abort) continue to reach the
+// success arm of move_dispatch. This means the "real" guard-fires
+// branch is NOT reachable from a stub-only fixture -- injecting
+// "dst exists" requires either fault injection or the R42 sys_stat
+// wiring.
+//
+// This fixture therefore witnesses the PIECES that must be present
+// for the guard to fire correctly when the substrate lands:
+//
+//   Block A: happy-path baseline (stub probe returns 0).
+//     - Reset stats + force flag.
+//     - move_dispatch(0x1000, 0x2000) -> 0 (all stubs succeed).
+//     - Verify mv_move_dst_existed == 0 (probe took not-exists arm).
+//     - Verify MV_ST_DEST_REFUSED == 0 (guard did not fire).
+//
+//   Block B: MoveRecord.dst_existed populates from mv_move_dst_existed
+//     when the flag is 1.
+//     - Set mv_move_dst_existed = 1 directly.
+//     - mv_schema_reset + mv_schema_populate(0x1000, 0x2000).
+//     - Verify mv_move_record[80] == 1.
+//     - Verify mv_move_record[0]  == MV_MOVE_RECORD_MAGIC v2
+//       (0xFFFFEB5000000002; the magic bump documents the layout
+//        widening for a consumer that gates on schema version).
+//
+//   Block C: MoveRecord.dst_existed clears with mv_move_dst_existed.
+//     - Set mv_move_dst_existed = 0.
+//     - mv_schema_reset + mv_schema_populate(0x1000, 0x2000).
+//     - Verify mv_move_record[80] == 0.
+//
+//   Block D: mv_dst_exists_diag is a best-effort emission that
+//     returns 0 (per the D3 audit-first contract -- the refuse
+//     decision is already made before the diagnostic writes).
+//     - Call mv_dst_exists_diag(0x1000, 0x2000) -> 0.
+//
+//   Block E: MV_ST_DEST_REFUSED slot is live in the stats table.
+//     - Snapshot stat[16].
+//     - mv_note(16).
+//     - Verify stat[16] delta == 1.
+//
+// When R42 sys_stat is wired into Pdxfs::pdxfs_dst_exists, a
+// Round-2 amendment to this file adds:
+//
+//   Block F: real guard fires on existing dst without -f.
+//     - Create a real dst file on the fixture PdxFS mount.
+//     - Reset argv_force = 0.
+//     - move_dispatch(src, dst) -> MV_MV_DST_EXISTS.
+//     - Verify MV_ST_DEST_REFUSED bumped by 1.
+//     - Verify MV_ST_ERRORS bumped by 1.
+//     - Verify no TXN was opened (MV_ST_TXN_OPENS unchanged).
+//     - Verify src still resolves (source dirent intact).
+//     - Verify dst byte-identical to its prior contents.
+//
+//   Block G: real guard skips with -f granted.
+//     - Same fixture as Block F.
+//     - Set mv_argv_force = 1.
+//     - move_dispatch(src, dst) -> 0.
+//     - Verify mv_move_dst_existed == 1 (probe still saw it).
+//     - Verify MV_ST_DEST_REFUSED unchanged (guard skipped).
+//     - Verify MV_ST_MOVES bumped by 1 (overwrite completed).
+//
+// The Round-2 amendment does not touch M1-M3 code or this file's
+// existing blocks -- the pdxfs_dst_exists body-swap is the only
+// substrate dependency and its return contract is stable at 0 /
+// >0 / <0 in both configurations.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFEBFx (TestDstExists)
+// =============================================================================
+//
+//   0xFFFFEBF0 MV_TEST_DE_OK              all-pass sentinel (== 0)
+//   0xFFFFEBF1 MV_TEST_DE_HAPPY_RC        move_dispatch happy path != 0
+//   0xFFFFEBF2 MV_TEST_DE_HAPPY_FLAG      mv_move_dst_existed != 0 on stub probe
+//   0xFFFFEBF3 MV_TEST_DE_HAPPY_REF_STAT  MV_ST_DEST_REFUSED != 0 on happy path
+//   0xFFFFEBF4 MV_TEST_DE_REC_ONE_FIELD   record[80] != 1 after dst_existed=1 populate
+//   0xFFFFEBF5 MV_TEST_DE_REC_MAGIC       record[0]  != 0xFFFFEB5000000002 (schema v2)
+//   0xFFFFEBF6 MV_TEST_DE_REC_ZERO_FIELD  record[80] != 0 after dst_existed=0 populate
+//   0xFFFFEBF7 MV_TEST_DE_DIAG_RC         mv_dst_exists_diag returned non-zero
+//   0xFFFFEBF8 MV_TEST_DE_REF_SLOT        MV_ST_DEST_REFUSED slot delta != 1
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestDstExists`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Return-code
+//     compares stage through rcx for values > imm32 -- the v2 magic
+//     0xFFFFEB5000000002 does NOT fit imm32 (> 0x7FFFFFFF as signed
+//     imm32), so its compare uses `mov rcx, imm64; cmp rax, rcx`
+//     reg-reg pattern. Same idiom Move::move_dispatch uses for the
+//     -EXDEV compare.
+//   - Byte reads not used (record fields are u64-strided).
+//   - r11 is scratch (paideia-as reserved) for every .bss reach.
+//   - test_dst_exists_run has nested SysV calls (mv_reset, mv_stat,
+//     mv_note, move_dispatch, mv_schema_reset, mv_schema_populate,
+//     mv_dst_exists_diag). Prologue is 1 callee-save push (rbx =
+//     stat-delta baseline) + sub rsp, 8 = 16 bytes; entry rsp % 16
+//     == 8, 1 push flips parity to 0, sub 8 lands rsp % 16 == 8 --
+//     WRONG. Fix: use 1 push + no sub (rsp % 16 == 0 after 1 push)
+//     OR 0 pushes + sub 8 (rsp % 16 == 0). Choose 1 push + no sub
+//     because we need one callee-save for the DEST_REFUSED baseline.
+//     Actually: entry rsp % 16 == 8; push flips to 0. So no sub
+//     needed. Matched pop epilogue on every ret.
+
+module TestDstExists = structure {
+
+  // ==========================================================================
+  // Block-D safe path fixture: a single NUL byte. Passed to
+  // mv_dst_exists_diag so Rename::rn_strlen returns 0 immediately
+  // instead of walking arbitrary low VAs. The fixture is in-module
+  // storage so the pointer is a real user-VA the test harness has
+  // access to (unlike 0x1000 / 0x2000 which are opaque bit-patterns
+  // move_dispatch does not dereference at M2).
+  // ==========================================================================
+  pub let TDE_EMPTY : [u8; 1] = "\0"
+
+  // ==========================================================================
+  // test_dst_exists_run() -> u64
+  //
+  // The ENH-004 witness entry point. Runs five blocks in order:
+  //
+  //   Block A: happy-path baseline (stub probe returns 0).
+  //   Block B: MoveRecord.dst_existed populates when flag is 1.
+  //   Block C: MoveRecord.dst_existed clears when flag is 0.
+  //   Block D: mv_dst_exists_diag returns 0 (best-effort emit).
+  //   Block E: MV_ST_DEST_REFUSED slot is live.
+  //
+  // Fail-fast: first non-matching check returns a distinct
+  // MV_TEST_DE_* code so a debugger identifies the exact witness
+  // that broke.
+  //
+  // Return: 0 on all-pass; MV_TEST_DE_* on first failure.
+  // ==========================================================================
+  pub let test_dst_exists_run : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mv.ENH-004 (#20): TestDstExists::test_dst_exists_run -- destination-clobber guard witness. Substrate state at HEAD: Pdxfs::pdxfs_dst_exists is an M2 STUB returning 0 (dst does not exist), so the guard's `refuse` branch is NOT reachable from a stub-only fixture. This witness therefore verifies the PIECES (flag storage, schema field, diag helper, stat slot) that must be present for the guard to fire correctly when the R42 sys_stat body-swap lands. Block A: move_dispatch happy path leaves mv_move_dst_existed == 0 and MV_ST_DEST_REFUSED == 0 (probe took not-exists arm). Block B: manually set mv_move_dst_existed = 1, call mv_schema_populate, verify record[80] == 1 AND record[0] == MV_MOVE_RECORD_MAGIC v2 (0xFFFFEB5000000002 -- staged through rcx because the imm64 does not fit imm32). Block C: same shape with flag = 0, verify record[80] == 0. Block D: mv_dst_exists_diag returns 0 (best-effort per D3 audit-first). Block E: mv_note(16) bumps MV_ST_DEST_REFUSED by 1. Prologue is 1 callee-save push (rbx = DEST_REFUSED baseline for block E delta) = 8 bytes; entry rsp % 16 == 8, 1 push flips to rsp % 16 == 0 for the nested SysV calls (no additional sub needed). Matched pop epilogue on every ret path. Effects @{cap, sched} match move_dispatch's declared tail (transitive). Labels prefixed mv_tde_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;                                    // rbx = block E baseline
+
+        // Reset stats to a known baseline.
+        call mv_reset;
+        call mv_argv_reset;                          // clear force flag from any prior run
+
+        // ====================================================================
+        // Block A: happy-path baseline (stub probe returns 0)
+        // ====================================================================
+
+        mov rdi, 0x1000;                             // src fixture pointer
+        mov rsi, 0x2000;                             // dst fixture pointer
+        call move_dispatch;
+        cmp rax, 0;
+        jne mv_tde_happy_rc;
+
+        // Verify mv_move_dst_existed == 0 (probe stub returned 0).
+        lea r11, [rip + mv_move_dst_existed];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mv_tde_happy_flag;
+
+        // Verify MV_ST_DEST_REFUSED == 0 (guard did not fire).
+        mov rdi, 16;                                 // MV_ST_DEST_REFUSED
+        call mv_stat;
+        cmp rax, 0;
+        jne mv_tde_happy_ref_stat;
+
+        // ====================================================================
+        // Block B: MoveRecord.dst_existed populates when flag is 1
+        // ====================================================================
+
+        // Manually set mv_move_dst_existed = 1 (simulates the guard
+        // branch that fires on -f overwrite or refuse).
+        mov rax, 1;
+        lea r11, [rip + mv_move_dst_existed];
+        mov [r11], rax;
+
+        call mv_schema_reset;
+        mov rdi, 0x1000;                             // src
+        mov rsi, 0x2000;                             // dst
+        call mv_schema_populate;
+
+        // Verify record[80] == 1 (MRO_DST_EXISTED offset).
+        lea r11, [rip + mv_move_record];
+        mov rax, [r11 + 80];
+        cmp rax, 1;
+        jne mv_tde_rec_one_field;
+
+        // Verify record[0] == MV_MOVE_RECORD_MAGIC v2.
+        mov rax, [r11 + 0];
+        mov rcx, 0xFFFFEB5000000002;                 // staged (does not fit imm32)
+        cmp rax, rcx;
+        jne mv_tde_rec_magic;
+
+        // ====================================================================
+        // Block C: MoveRecord.dst_existed clears when flag is 0
+        // ====================================================================
+
+        xor rax, rax;
+        lea r11, [rip + mv_move_dst_existed];
+        mov [r11], rax;                              // mv_move_dst_existed = 0
+
+        call mv_schema_reset;
+        mov rdi, 0x1000;
+        mov rsi, 0x2000;
+        call mv_schema_populate;
+
+        lea r11, [rip + mv_move_record];
+        mov rax, [r11 + 80];
+        cmp rax, 0;
+        jne mv_tde_rec_zero_field;
+
+        // ====================================================================
+        // Block D: mv_dst_exists_diag is best-effort (returns 0)
+        // ====================================================================
+
+        // Pass &TDE_EMPTY for both src and dst so rn_strlen returns 0
+        // immediately (walking the fixture 0x1000 / 0x2000 pointers
+        // could fault if the harness has no low-VA mapping). The
+        // diagnostic still exercises all five sys_write call sites
+        // with zero-length path bodies; mv_dst_exists_diag returns 0
+        // unconditionally regardless of any sys_write refusal.
+        lea rdi, [rip + TDE_EMPTY];
+        lea rsi, [rip + TDE_EMPTY];
+        call mv_dst_exists_diag;
+        cmp rax, 0;
+        jne mv_tde_diag_rc;
+
+        // ====================================================================
+        // Block E: MV_ST_DEST_REFUSED slot is live
+        // ====================================================================
+
+        // Snapshot baseline.
+        mov rdi, 16;                                 // MV_ST_DEST_REFUSED
+        call mv_stat;
+        mov rbx, rax;                                // rbx = baseline
+
+        // Bump it.
+        mov rdi, 16;
+        call mv_note;
+
+        // Verify the delta is exactly 1.
+        mov rdi, 16;
+        call mv_stat;
+        sub rax, rbx;
+        cmp rax, 1;
+        jne mv_tde_ref_slot;
+
+        // ---- All-pass --------------------------------------------------------
+        xor rax, rax;                                // MV_TEST_DE_OK (0)
+        pop rbx;
+        ret;
+
+      mv_tde_happy_rc:
+        mov rax, 0xFFFFEBF1;                         // MV_TEST_DE_HAPPY_RC
+        pop rbx;
+        ret;
+
+      mv_tde_happy_flag:
+        mov rax, 0xFFFFEBF2;                         // MV_TEST_DE_HAPPY_FLAG
+        pop rbx;
+        ret;
+
+      mv_tde_happy_ref_stat:
+        mov rax, 0xFFFFEBF3;                         // MV_TEST_DE_HAPPY_REF_STAT
+        pop rbx;
+        ret;
+
+      mv_tde_rec_one_field:
+        mov rax, 0xFFFFEBF4;                         // MV_TEST_DE_REC_ONE_FIELD
+        pop rbx;
+        ret;
+
+      mv_tde_rec_magic:
+        mov rax, 0xFFFFEBF5;                         // MV_TEST_DE_REC_MAGIC
+        pop rbx;
+        ret;
+
+      mv_tde_rec_zero_field:
+        mov rax, 0xFFFFEBF6;                         // MV_TEST_DE_REC_ZERO_FIELD
+        pop rbx;
+        ret;
+
+      mv_tde_diag_rc:
+        mov rax, 0xFFFFEBF7;                         // MV_TEST_DE_DIAG_RC
+        pop rbx;
+        ret;
+
+      mv_tde_ref_slot:
+        mov rax, 0xFFFFEBF8;                         // MV_TEST_DE_REF_SLOT
+        pop rbx;
+        ret
+      }
+    }
+}

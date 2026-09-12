@@ -22,16 +22,16 @@
 
 [package]
 name          = mv
-version       = 1.0.0
+version       = 1.1.0
 wave          = R50
 milestone     = M5
 category      = A/coreutils
 priority      = P0
 license       = MIT
 repository    = https://github.com/paideia-os/mv
-tag           = v1.0.0
+tag           = v1.1.0
 authored_by   = paideia-os-team
-released      = 2026-08-22
+released      = 2026-09-12
 
 [caps]
 # caps.decl fingerprint (BLAKE3-256 over the caps.decl file bytes at
@@ -84,7 +84,7 @@ src/pdxfs.pdx    = pending:src-pdxfs-blake3-256
 # Corrected by mv.ENH-009 (paideia-os/mv#25) -- this stanza named a
 # pre-M3 placeholder (schema id 0x4D56, 64 bytes) that was never
 # updated to match the M3-001 implementation.
-MoveRecord = 0xFFFFEB5000000001  # 80 bytes; fields per doc/mv.pdxdoc .TOPIC schemas
+MoveRecord = 0xFFFFEB5000000002  # 88 bytes; schema v2 adds dst_existed at offset 80 (mv.ENH-004, #20)
 
 [undo]
 # PdxFS v1 undo record shape threaded by Undo::mv_undo_write on commit

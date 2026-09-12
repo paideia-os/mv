@@ -7,13 +7,19 @@ whose replay is `mv <dst> <src>`.
 ## Synopsis
 
 ```
-mv [-v|--verbose] [-i] [--dry-run] <src> <dst>
+mv [-v|--verbose] [-i] [-f|--force] [--dry-run] <src> <dst>
 ```
 
 Exactly two positionals are required. `MvArgv::mv_argv_parse` rejects any
 other positional count with `MV_ARG_TOO_FEW_POS` and any flag outside the
-whitelist `{v, verbose, i, dry-run}` with `MV_ARG_UNKNOWN_FLAG` (`src/argv.pdx`).
-The multi-source form `mv f1 f2 … dir/` is not accepted at 1.0.0.
+whitelist `{v, verbose, i, f, force, dry-run}` with `MV_ARG_UNKNOWN_FLAG`
+(`src/argv.pdx`). The multi-source form `mv f1 f2 … dir/` is not accepted
+at 1.1.0.
+
+At 1.1.0 mv refuses to overwrite an existing destination by default
+(mv.ENH-004, #20). Pass `-f` / `--force` to consent to the overwrite; the
+refuse path returns `MV_MV_DST_EXISTS` (`0xFFFFEB3E`) and leaves both
+source and destination untouched.
 
 ## Description
 
@@ -82,13 +88,14 @@ pkg install --from-source mv
 ## Options
 
 Flag names are matched byte-for-byte against the whitelist in
-`MvArgv::mv_argv_parse`; all three are boolean (no value operand), and all
-three default to `0`.
+`MvArgv::mv_argv_parse`; all four are boolean (no value operand), and all
+four default to `0`.
 
 | Short | Long        | Argument | Default | Description |
 |-------|-------------|----------|---------|-------------|
 | `-v`  | `--verbose` | none     | `0`     | Emit the cross-device / cross-user advisories on stderr (fd 2) after a successful commit. Sets `mv_argv_verbose`. |
-| `-i`  | —           | none     | `0`     | Interactive. Parsed into `mv_argv_interactive`; **no consumer at 1.0.0** — the prompt lands with the shell.M4 line reader reachable through `KIND_TTY`. |
+| `-i`  | —           | none     | `0`     | Interactive. Parsed into `mv_argv_interactive`; **no consumer at 1.1.0** — the prompt lands with the shell.M4 line reader reachable through `KIND_TTY`. |
+| `-f`  | `--force`   | none     | `0`     | Consent to overwriting an existing destination (mv.ENH-004, #20). Without it, `move_dispatch` refuses the move with `MV_MV_DST_EXISTS` when `Pdxfs::pdxfs_dst_exists` reports the destination present. Sets `mv_argv_force`. |
 | —     | `--dry-run` | none     | `0`     | Parse + validate + resolve parents only (mv.ENH-007, #23). `move_dispatch` checks `mv_argv_dry_run` immediately after resolving both parents and the source inode, and returns success without opening a TXN, emitting a MoveRecord, writing the audit journal, or threading an undo record. |
 
 One caveat that the source contradicts the `.pdxdoc` on, and which the source
@@ -96,8 +103,8 @@ wins:
 
 - `--interactive` (the long spelling of `-i`) is **not** accepted. The
   whitelist compares against the literal names `"v"`, `"verbose"`, `"i"`,
-  `"dry-run"`; anything else returns `MV_ARG_UNKNOWN_FLAG` with the offending
-  index left in `mv_argv_error_flag_index`.
+  `"f"`, `"force"`, `"dry-run"`; anything else returns `MV_ARG_UNKNOWN_FLAG`
+  with the offending index left in `mv_argv_error_flag_index`.
 - `-v` / `--verbose` does not print a generic `mv <src> <dst>` line. `Verbose::mv_verbose_diag`
   emits only the two advisories, and only when the corresponding flag fired:
 
@@ -111,12 +118,16 @@ wins:
 
 ## Semantic pipe output
 
-Every successful move emits exactly one `MoveRecord` — 80 bytes, ten `u64`
-fields — via `Schema::mv_schema_emit`. At 1.0.0 that is a raw
-`pdxfs_write(fd = 1, …)` to stdout; when `libpdx-semantic-pipe` lands the same
-call site switches to a schema-tagged endpoint without changing any caller.
-A reader validates `magic == 0xFFFFEB5000000001` (high half = the `0xFFFFEB50`
-Schema band, low half = layout version 1) before decoding.
+Every successful move emits exactly one `MoveRecord` — 88 bytes, eleven `u64`
+fields at schema v2 (widened from 80/10 by mv.ENH-004, #20 for the
+`dst_existed` field at offset 80) — via `Schema::mv_schema_emit`. A refused
+move (destination existed and no `-f` / `--force`) also emits the record
+with `dst_existed = 1` so the semantic-pipe consumer sees the refused intent.
+At 1.1.0 that is a raw `pdxfs_write(fd = 1, …)` to stdout; when
+`libpdx-semantic-pipe` lands the same call site switches to a schema-tagged
+endpoint without changing any caller. A reader validates
+`magic == 0xFFFFEB5000000002` (high half = the `0xFFFFEB50` Schema band, low
+half = layout version 2) before decoding.
 
 The emit is best-effort from `move_dispatch`'s perspective: a short write
 (`MV_SCH_SHORT_WRITE`) or a negative errno (`MV_SCH_EMIT_FAIL`) bumps
@@ -213,12 +224,23 @@ $ mv -v report.pdx /mnt/archive/report.pdx
 mv: crossed device (cp+rm fallback, not O(1))
 ```
 
-A rejected flag. `--force` is not in the whitelist, so parsing stops before any
-filesystem work and `mv_argv_parse` returns `MV_ARG_UNKNOWN_FLAG`
-(`0xFFFFEB14`), exit `2`:
+A destination-clobber guard refusal (mv.ENH-004, #20). `b` already exists
+and `-f` / `--force` is absent; `move_dispatch` probes `pdxfs_dst_exists`
+before opening a TXN, refuses with `MV_MV_DST_EXISTS` (`0xFFFFEB3E`), and
+emits the diagnostic to stderr:
 
 ```
-mv --force a b
+$ mv a b
+mv: cannot move 'a' to 'b': destination exists (use -f to overwrite)
+$ mv -f a b            # overwrite consented; mv proceeds
+```
+
+A rejected flag. `--unknown` is not in the whitelist, so parsing stops
+before any filesystem work and `mv_argv_parse` returns
+`MV_ARG_UNKNOWN_FLAG` (`0xFFFFEB14`), exit `2`:
+
+```
+mv --unknown a b
 ```
 
 An audit-journal outage. `svc.audit-journal` is unreachable, `ipc_send` returns
@@ -234,7 +256,7 @@ mv a b
 Three fixed-layout records are built in `.bss` and shipped off the process.
 All fields are `u64`; all offsets are literal in the emitting assembly.
 
-**MoveRecord** — 80 bytes, `src/schema.pdx`. Populated by
+**MoveRecord** — 88 bytes at schema v2, `src/schema.pdx`. Populated by
 `mv_schema_populate(src_ptr, dst_ptr)` and emitted on the semantic pipe by
 `Schema::mv_schema_emit`. `Audit::mv_audit_write_move` (mv.ENH-008, #24) no
 longer sends this record verbatim to `svc.audit-journal` itself — it reports
@@ -245,7 +267,7 @@ placeholder `output_hash`.
 
 | Offset | Field | Notes |
 |--------|-------|-------|
-| 0 | `magic` | `MV_MOVE_RECORD_MAGIC` = `0xFFFFEB5000000001` |
+| 0 | `magic` | `MV_MOVE_RECORD_MAGIC` = `0xFFFFEB5000000002` (schema v2) |
 | 8 | `was_rename` | `1` iff `src_parent == dst_parent` |
 | 16 | `was_cross_device` | mirrors `Move::mv_move_was_cross_device` |
 | 24 | `was_cross_user` | mirrors `Move::mv_move_was_cross_user` |
@@ -255,6 +277,7 @@ placeholder `output_hash`.
 | 56 | `src_parent` | source parent inode |
 | 64 | `dst_parent` | destination parent inode |
 | 72 | `txn_handle` | lets a consumer correlate the record to PdxFS TXN state |
+| 80 | `dst_existed` | mv.ENH-004 (#20): `1` iff destination existed at probe time |
 
 The path fields are opaque pointers into the caller's argv memory — `mv` does
 not copy the strings into the record. Both M3 consumers write synchronously, so

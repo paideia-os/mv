@@ -11,6 +11,7 @@ files, one per M4 issue:
 | `test_txn_abort.pdx`    | #12   | `TestTxnAbort::test_txn_abort_run`       | mv.M4-001 TXN-abort mid-move: source restored, no dest artifact.  |
 | `test_undo_replay.pdx`  | #13   | `TestUndoReplay::test_undo_replay_run`   | mv.M4-002 undo replay correctness across all four move cases.     |
 | `test_smoke.pdx`        | #14   | `TestSmoke::test_smoke_run`              | mv.M4-003 QEMU smoke -- shape-smoke + live-harness runbook below. |
+| `test_dst_exists.pdx`   | #20   | `TestDstExists::test_dst_exists_run`     | mv.ENH-004 dst-clobber guard + MoveRecord.dst_existed witness.    |
 
 Each entry point returns `0` on all-pass or a distinct `MV_TEST_*`
 code (0xFFFFEBCx / 0xFFFFEBDx / 0xFFFFEBEx bands) on the first
@@ -30,6 +31,7 @@ error space (0xFFFFEBxx):
 | 0xFFFFEBCx | `test_txn_abort.pdx`   | 11 codes (MV_TEST_ABT_OK..MV_TEST_ABT_ERR_LEAK).            |
 | 0xFFFFEBDx | `test_undo_replay.pdx` | 8 codes (MV_TEST_UND_OK..MV_TEST_UND_STAT_FAIL).            |
 | 0xFFFFEBEx | `test_smoke.pdx`       | 16 codes (MV_TEST_SMK_OK..MV_TEST_SMK_ELV_STAT).            |
+| 0xFFFFEBFx | `test_dst_exists.pdx`  | 9 codes  (MV_TEST_DE_OK..MV_TEST_DE_REF_SLOT).              |
 
 The all-pass sentinel is aliased to `0` in every fixture (via
 `xor rax, rax; ret`) so a POSIX-conforming caller sees exit code 0

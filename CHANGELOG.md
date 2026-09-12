@@ -9,6 +9,35 @@ and the issues each entry closes.
 
 ## Unreleased (Enhancement v1.x)
 
+- `mv.ENH-004` (#20): destination-clobber guard. `Move::move_dispatch`
+  (`src/move.pdx`) now probes the destination path via a new
+  `Pdxfs::pdxfs_dst_exists` trampoline BEFORE opening the PdxFS TXN
+  and refuses the move with `MV_MV_DST_EXISTS` (0xFFFFEB3E) unless
+  the caller passed `-f` / `--force`. The refuse path emits the
+  stderr diagnostic `mv: cannot move '<src>' to '<dst>': destination
+  exists (use -f to overwrite)\n`, populates + emits the MoveRecord
+  with `dst_existed = 1`, bumps the new `MV_ST_DEST_REFUSED` (slot 16)
+  and `MV_ST_ERRORS` counters, and returns without ever opening a
+  TXN -- the source dirent stays intact and the destination is byte-
+  identical to its prior contents. The `-f`-consented overwrite path
+  still sets `mv_move_dst_existed = 1` so the emitted MoveRecord
+  distinguishes a fresh-create from a clobber-consented move. New
+  `MvArgv::mv_argv_force` slot + `-f` / `--force` flag whitelist
+  entry in `src/argv.pdx` (long form byte-walks against `"force\0"`).
+  New `Move::mv_move_dst_existed` .bss slot cleared in `move_reset`.
+  New `Move::mv_dst_exists_diag(src, dst)` best-effort emitter uses
+  five `pdxfs_write` calls with `Rename::rn_strlen` for the path
+  bodies. MoveRecord widened from 80 to 88 bytes with `dst_existed`
+  at offset 80; schema magic bumps to `0xFFFFEB5000000002`
+  (SCHEMA_LABEL to `"MoveRecord@0.2"`); `Mv::_mv_stats` widened to
+  17 live slots (24 reserved) with `MV_ST_MAX` = 17. New
+  `tests/test_dst_exists.pdx` fixture (band `0xFFFFEBFx`, entry
+  `TestDstExists::test_dst_exists_run`) witnesses the guard pieces
+  (flag storage, schema field, diag helper, stat slot) that must be
+  present for the guard to fire correctly when the R42 `sys_stat`
+  substrate body-swap lands. At HEAD the M2 `pdxfs_dst_exists` stub
+  returns 0 (does-not-exist) so the M4 fixtures (test_smoke /
+  test_txn_abort) continue to reach their success arms unchanged.
 - `mv.v1.1-A`: retired the M1-003 `MV_RN_STUB` (0xFFFFEB20) that
   deferred `Rename::rename_same_dir` (`src/rename.pdx`) to the
   R42 PdxFS v1 substrate. The rename dispatcher now consumes the

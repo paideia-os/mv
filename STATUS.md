@@ -339,6 +339,7 @@ breakdown.
 | 0xFFFFEB3B | MV_MV_XDEV_WRITE_FAIL    | cross-dev fallback: sys_write failed      |
 | 0xFFFFEB3C | MV_MV_XDEV_SHORT_WRITE   | cross-dev fallback: short write           |
 | 0xFFFFEB3D | MV_MV_XDEV_UNLINK_FAIL   | cross-dev fallback: pdxfs_unlink refused  |
+| 0xFFFFEB3E | MV_MV_DST_EXISTS         | ENH-004: dst existed + no -f / --force    |
 | 0xFFFFEB50 | MV_SCH_STUB              | Schema.M3-001: reserved                    |
 | 0xFFFFEB51 | MV_SCH_EMIT_FAIL         | Schema.M3-001: pdxfs_write neg errno       |
 | 0xFFFFEB52 | MV_SCH_SHORT_WRITE       | Schema.M3-001: pdxfs_write short           |
@@ -386,6 +387,15 @@ breakdown.
 | 0xFFFFEBED | MV_TEST_SMK_XDEV_STAT    | MV_ST_CROSS_DEV != 0                      |
 | 0xFFFFEBEE | MV_TEST_SMK_XDIR_STAT    | MV_ST_CROSS_DIR != 0                      |
 | 0xFFFFEBEF | MV_TEST_SMK_ELV_STAT     | MV_ST_ELEVATE_ATTEMPTS != 0               |
+| 0xFFFFEBF0 | MV_TEST_DE_OK            | test_dst_exists_run all-pass sentinel     |
+| 0xFFFFEBF1 | MV_TEST_DE_HAPPY_RC      | move_dispatch happy path != 0             |
+| 0xFFFFEBF2 | MV_TEST_DE_HAPPY_FLAG    | mv_move_dst_existed != 0 on stub probe    |
+| 0xFFFFEBF3 | MV_TEST_DE_HAPPY_REF_STAT| MV_ST_DEST_REFUSED != 0 on happy path     |
+| 0xFFFFEBF4 | MV_TEST_DE_REC_ONE_FIELD | record[80] != 1 after dst_existed=1 pop.  |
+| 0xFFFFEBF5 | MV_TEST_DE_REC_MAGIC     | record[0]  != 0xFFFFEB5000000002 (v2)     |
+| 0xFFFFEBF6 | MV_TEST_DE_REC_ZERO_FIELD| record[80] != 0 after dst_existed=0 pop.  |
+| 0xFFFFEBF7 | MV_TEST_DE_DIAG_RC       | mv_dst_exists_diag returned non-zero      |
+| 0xFFFFEBF8 | MV_TEST_DE_REF_SLOT      | MV_ST_DEST_REFUSED slot delta != 1        |
 
 ## Milestone rollup
 
@@ -407,6 +417,7 @@ breakdown.
 | M4-003 (#14)    | QEMU smoke: mv a b; undo mv a b; ls verifies                  | LANDED |
 | M5-001 (#15)    | dual-signed release + .pdxdoc                                 | LANDED |
 | M5-002 (#16)    | mirror push (repo tag; pkgs.paideia-os pending T-INFRA)       | LANDED |
+| ENH-004 (#20)   | dst-clobber guard + MoveRecord.dst_existed (schema v2)        | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-22)
 

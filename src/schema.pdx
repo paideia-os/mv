@@ -18,9 +18,11 @@
 //
 // This module owns:
 //
-//   * The MoveRecord fixed layout (a single 80-byte record;
-//     ten u64 fields at fixed offsets). One record per invocation
-//     because mv is a one-source-one-destination tool at M3.
+//   * The MoveRecord fixed layout (a single 88-byte record at schema
+//     v2; eleven u64 fields at fixed offsets, widened from 80/10 by
+//     mv.ENH-004 (#20) for the dst_existed field at offset 80). One
+//     record per invocation because mv is a one-source-one-destination
+//     tool at M3.
 //   * A single .bss slot (mv_move_record) sized to hold the record.
 //   * mv_schema_reset() to clear the slot.
 //   * mv_schema_populate(src_ptr, dst_ptr) to fill the record from
@@ -56,7 +58,7 @@
 // callers (currently only Move::move_dispatch) do not change.
 //
 // =============================================================================
-// RECORD LAYOUT (80 bytes; ten u64 fields; @align(8))
+// RECORD LAYOUT (88 bytes; eleven u64 fields; @align(8))
 // =============================================================================
 //
 //   Offset  Size  Field
@@ -70,6 +72,14 @@
 //       56     8  src_parent         (mirror of Move::mv_move_src_parent)
 //       64     8  dst_parent         (mirror of Move::mv_move_dst_parent)
 //       72     8  txn_handle         (mirror of Move::mv_move_txn_handle)
+//       80     8  dst_existed        (mv.ENH-004, #20 -- mirror of
+//                                     Move::mv_move_dst_existed; 1 iff
+//                                     Pdxfs::pdxfs_dst_exists reported
+//                                     the destination present at probe
+//                                     time. Set for both refuses (no -f)
+//                                     AND overwrites (-f), so a consumer
+//                                     can distinguish a create from a
+//                                     clobber-consented move)
 //
 // The path pointers are opaque (u64) -- downstream consumers that
 // care about the string values follow the pointers into the caller's
@@ -104,7 +114,7 @@ module Schema = structure {
   // literal imm; named constants in operand positions are not part of
   // the module-scope symbol resolution).
   // ==========================================================================
-  pub let MV_MOVE_RECORD_SIZE  : u64 = 80
+  pub let MV_MOVE_RECORD_SIZE  : u64 = 88
 
   pub let MRO_MAGIC            : u64 = 0
   pub let MRO_WAS_RENAME       : u64 = 8
@@ -116,17 +126,22 @@ module Schema = structure {
   pub let MRO_SRC_PARENT       : u64 = 56
   pub let MRO_DST_PARENT       : u64 = 64
   pub let MRO_TXN_HANDLE       : u64 = 72
+  pub let MRO_DST_EXISTED      : u64 = 80   // mv.ENH-004 (#20)
 
   // ==========================================================================
   // MoveRecord magic / schema id
   //
   // High 32 bits = 0xFFFFEB50 (mv's Schema-band tag; sits in the M3
-  // schema band 0xFFFFEB5x). Low 32 bits = 0x00000001 (schema version
-  // 1). A downstream libpdx-semantic-pipe reader verifies this magic
-  // before decoding; a bump of the low 32 bits signals a layout change
-  // (add a field, widen a slot).
+  // schema band 0xFFFFEB5x). Low 32 bits = schema version. A downstream
+  // libpdx-semantic-pipe reader verifies this magic before decoding;
+  // a bump of the low 32 bits signals a layout change (add a field,
+  // widen a slot).
+  //
+  //   0x00000001 -- M3-001 landing, 80 bytes / ten u64 fields
+  //   0x00000002 -- mv.ENH-004 (#20) adds dst_existed at offset 80,
+  //                  88 bytes / eleven u64 fields
   // ==========================================================================
-  pub let MV_MOVE_RECORD_MAGIC : u64 = 0xFFFFEB5000000001
+  pub let MV_MOVE_RECORD_MAGIC : u64 = 0xFFFFEB5000000002
 
   // ==========================================================================
   // Semantic-pipe fd for M3-001 stub emit
@@ -146,7 +161,7 @@ module Schema = structure {
   // RmSchema::SCHEMA_LABEL ("RemoveRecord@0.1") consumed by
   // Audit::audit_record_target in paideia-os/rm src/audit.pdx.
   // ==========================================================================
-  pub let SCHEMA_LABEL     : [u8; 15] = "MoveRecord@0.1\0"
+  pub let SCHEMA_LABEL     : [u8; 15] = "MoveRecord@0.2\0"
   pub let SCHEMA_LABEL_LEN : u64      = 14
 
   // ==========================================================================
@@ -168,7 +183,7 @@ module Schema = structure {
   // is per-invocation state (populate-once-emit-once); no cache-line
   // sharing concern the way _mv_stats has for its future SMP variant.
   // ==========================================================================
-  pub let mut mv_move_record : [u8; 80] = uninit @align(8)
+  pub let mut mv_move_record : [u8; 88] = uninit @align(8)
 
   // ==========================================================================
   // mv_schema_reset() -> ()
@@ -180,7 +195,7 @@ module Schema = structure {
   pub let mv_schema_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M3-001 (#8): zero the ten-u64 mv_move_record buffer so a subsequent mv_schema_populate starts from a known-empty baseline. Ten `mov [r11 + off], rax` stores at offsets 0/8/16/24/32/40/48/56/64/72 (literal immediates, no named-constant operand resolution needed). Same idiom as mv_argv_reset (src/argv.pdx) and move_reset (src/move.pdx). r11 is scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      justification: "mv.M3-001 (#8) + mv.ENH-004 (#20): zero the eleven-u64 mv_move_record buffer (ENH-004 widened 10 -> 11 slots for the new dst_existed field at offset 80) so a subsequent mv_schema_populate starts from a known-empty baseline. Eleven `mov [r11 + off], rax` stores at offsets 0/8/16/24/32/40/48/56/64/72/80 (literal immediates, no named-constant operand resolution needed). Same idiom as mv_argv_reset (src/argv.pdx) and move_reset (src/move.pdx). r11 is scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
       block: {
         xor rax, rax;
         lea r11, [rip + mv_move_record];
@@ -194,6 +209,7 @@ module Schema = structure {
         mov [r11 + 56], rax;
         mov [r11 + 64], rax;
         mov [r11 + 72], rax;
+        mov [r11 + 80], rax;
         ret
       }
     }
@@ -222,10 +238,10 @@ module Schema = structure {
   pub let mv_schema_populate : (u64, u64) -> () !{mem} @{} =
     fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M3-001 (#8): populate the MoveRecord slot from Move::mv_move_* .bss + the two path pointers. Ten field stores at literal offsets 0/8/16/24/32/40/48/56/64/72; each field reads its source (mv_move_src_parent etc.) via `lea r11, [rip + sym]; mov rax, [r11]` then stores via `lea r11, [rip + mv_move_record]; mov [r11 + off], rax`. was_rename derivation: cmp mv_move_src_parent with mv_move_dst_parent and branch to a store-0 or store-1 arm. The path pointers rdi/rsi survive verbatim into the record slot -- no callee to clobber them, so the store `mov [r11 + 32], rdi` and `mov [r11 + 40], rsi` are direct writes from the arg registers. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only implicit zero via `cmp rax, rcx` here). r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. MOVE_RECORD_MAGIC is > 32-bit so it uses `mov r64, imm64` encoding (`mov rax, 0xFFFFEB5000000001`). Labels prefixed mv_sp_.",
+      justification: "mv.M3-001 (#8) + mv.ENH-004 (#20): populate the MoveRecord slot from Move::mv_move_* .bss + the two path pointers. Eleven field stores at literal offsets 0/8/16/24/32/40/48/56/64/72/80 (ENH-004 widened 10 -> 11 for the dst_existed field). Each field reads its source (mv_move_src_parent etc.) via `lea r11, [rip + sym]; mov rax, [r11]` then stores via `lea r11, [rip + mv_move_record]; mov [r11 + off], rax`. was_rename derivation: cmp mv_move_src_parent with mv_move_dst_parent and branch to a store-0 or store-1 arm. The path pointers rdi/rsi survive verbatim into the record slot -- no callee to clobber them, so the store `mov [r11 + 32], rdi` and `mov [r11 + 40], rsi` are direct writes from the arg registers. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only implicit zero via `cmp rax, rcx` here). r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. MOVE_RECORD_MAGIC is > 32-bit so it uses `mov r64, imm64` encoding (`mov rax, 0xFFFFEB5000000002` at v2). Labels prefixed mv_sp_.",
       block: {
         // ---- Field 0: magic --------------------------------------------------
-        mov rax, 0xFFFFEB5000000001;                 // MV_MOVE_RECORD_MAGIC (imm64)
+        mov rax, 0xFFFFEB5000000002;                 // MV_MOVE_RECORD_MAGIC v2 (imm64)
         lea r11, [rip + mv_move_record];
         mov [r11 + 0], rax;
 
@@ -287,6 +303,17 @@ module Schema = structure {
         lea r11, [rip + mv_move_record];
         mov [r11 + 72], rax;
 
+        // ---- Field 80: dst_existed (mv.ENH-004, #20) -------------------------
+        // Mirror of Move::mv_move_dst_existed -- 1 iff the destination
+        // path was present at probe time (Pdxfs::pdxfs_dst_exists > 0).
+        // Set for both refuses (no -f) and overwrites (-f granted), so a
+        // consumer can distinguish a fresh-create move from a clobber-
+        // consented one purely from the record.
+        lea r11, [rip + mv_move_dst_existed];
+        mov rax, [r11];
+        lea r11, [rip + mv_move_record];
+        mov [r11 + 80], rax;
+
         ret
       }
     }
@@ -301,7 +328,7 @@ module Schema = structure {
   // Return:
   //   0                     on success
   //   MV_SCH_EMIT_FAIL      pdxfs_write returned negative errno
-  //   MV_SCH_SHORT_WRITE    pdxfs_write returned < 80 bytes
+  //   MV_SCH_SHORT_WRITE    pdxfs_write returned < 88 bytes (v2)
   //
   // Bumps MV_ST_RECORDS_EMITTED (slot 11) on success. Best-effort
   // from the caller's perspective -- Move::move_dispatch treats an
@@ -314,19 +341,19 @@ module Schema = structure {
   pub let mv_schema_emit : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "mv.M3-001 (#8): serialize the populated MoveRecord to the semantic-pipe fd. M3-001 stub emits to fd 1 (stdout) via Pdxfs::pdxfs_write; the R50 libpdx-semantic-pipe landing swaps the fd + wraps the payload with a schema-tagged envelope. Single nested SysV call; entry rsp % 16 == 8 + sub 8 = 0 for the call. `cmp rax, 0; jl fail` catches negative errno; `cmp rax, 80; jl short_write` catches partial write (80 fits imm32 window). On success bumps MV_ST_RECORDS_EMITTED (slot 11) via mv_note; on any failure bumps MV_ST_ERRORS (slot 5). Best-effort from caller's view -- move_dispatch does not gate commit on this. Labels prefixed mv_se_.",
+      justification: "mv.M3-001 (#8) + mv.ENH-004 (#20): serialize the populated MoveRecord to the semantic-pipe fd. M3-001 stub emits to fd 1 (stdout) via Pdxfs::pdxfs_write; the R50 libpdx-semantic-pipe landing swaps the fd + wraps the payload with a schema-tagged envelope. Single nested SysV call; entry rsp % 16 == 8 + sub 8 = 0 for the call. `cmp rax, 0; jl fail` catches negative errno; `cmp rax, 88; jl short_write` catches partial write (88 fits imm32 window; widened from 80 by ENH-004 for the dst_existed field). On success bumps MV_ST_RECORDS_EMITTED (slot 11) via mv_note; on any failure bumps MV_ST_ERRORS (slot 5). Best-effort from caller's view -- move_dispatch does not gate commit on this. Labels prefixed mv_se_.",
       block: {
         sub rsp, 8;                                  // align rsp % 16 == 0 for pdxfs_write
 
         mov rdi, 1;                                  // MV_SEMPIPE_FD (stdout at M3 stub)
         lea rsi, [rip + mv_move_record];             // buf
-        mov rdx, 80;                                 // MV_MOVE_RECORD_SIZE
+        mov rdx, 88;                                 // MV_MOVE_RECORD_SIZE (v2)
         call pdxfs_write;
 
         cmp rax, 0;
         jl  mv_se_emit_fail;                         // negative errno
 
-        cmp rax, 80;
+        cmp rax, 88;
         jl  mv_se_short_write;                       // partial write
 
         // Success: bump MV_ST_RECORDS_EMITTED and return 0.

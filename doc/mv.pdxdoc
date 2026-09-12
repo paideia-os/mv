@@ -42,10 +42,13 @@ mv handles four move shapes inside one dispatch entry
                   records the degrade.
 
 Every successful mv emits ONE MoveRecord on the semantic pipe
-(schema id 0xFFFFEB5000000001) carrying (magic, was_rename,
-was_cross_device, was_cross_user, src_ptr, dst_ptr, src_inode,
-src_parent, dst_parent, txn_handle) before any user-visible output
-leaves the process (D3 audit-first). The move is also reported to
+(schema id 0xFFFFEB5000000002, schema v2) carrying (magic,
+was_rename, was_cross_device, was_cross_user, src_ptr, dst_ptr,
+src_inode, src_parent, dst_parent, txn_handle, dst_existed) before
+any user-visible output leaves the process (D3 audit-first). A
+mv refused by the destination-clobber guard (mv.ENH-004, #20) also
+emits the record with dst_existed = 1 so the semantic-pipe consumer
+sees the refused intent. The move is also reported to
 /system/audit/user-events/ via libpdx-audit's AuditClient lifecycle
 (audit_begin / audit_record_output / audit_commit) before the TXN
 commit; on the commit path Undo::mv_undo_write threads a PdxFS undo
@@ -138,8 +141,9 @@ before any TXN is opened.
 .HEAD OUTPUT SCHEMAS
 mv emits ONE typed schema on its semantic pipe:
 
-  MoveRecord[] (schema id 0xFFFFEB5000000001, record size 80 bytes,
-  ten u64 fields at src/schema.pdx's fixed offsets)
+  MoveRecord[] (schema id 0xFFFFEB5000000002, schema v2, record size
+  88 bytes, eleven u64 fields at src/schema.pdx's fixed offsets --
+  widened from 80/10 by mv.ENH-004 (#20) for the dst_existed field)
     fields:
       magic           u64  MOVE_RECORD_MAGIC (schema id, offset 0)
       was_rename      u64  1 if src_parent == dst_parent
@@ -151,6 +155,9 @@ mv emits ONE typed schema on its semantic pipe:
       src_parent      u64  source parent directory inode
       dst_parent      u64  destination parent directory inode
       txn_handle      u64  correlates the record to PdxFS TXN state
+      dst_existed     u64  1 iff destination existed at probe time --
+                           set on both -f overwrites AND refused
+                           clobbers (mv.ENH-004, #20)
 
 There is no `elevated` field -- the elevate hop's outcome is not
 carried in MoveRecord at this release; a denied elevate is only

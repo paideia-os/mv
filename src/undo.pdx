@@ -109,7 +109,9 @@ module Undo = structure {
   //
   // High 32 bits = 0xFFFFEB70 (mv's Undo-band tag). Low 32 bits =
   // 0x00000001 (schema version 1). Parallel structure to
-  // Schema::MV_MOVE_RECORD_MAGIC (0xFFFFEB5000000001).
+  // Schema::MV_MOVE_RECORD_MAGIC (now 0xFFFFEB5000000002 at schema
+  // v2; mv.ENH-004 (#20) bumped that from v1 to accommodate the
+  // dst_existed field at offset 80).
   // ==========================================================================
   pub let MV_UNDO_MAGIC        : u64 = 0xFFFFEB7000000001
 

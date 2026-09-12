@@ -76,6 +76,7 @@ module Pdxfs = structure {
   pub let SYS_PDXFS_INODE_OWNER    : u64 = 520   // M2-004: signed-inode owner query
   pub let SYS_PDXFS_INODE_REBIND   : u64 = 521   // M2-004: re-sign inode under new owner
   pub let SYS_USER_SELF            : u64 = 528   // M2-004: R48 KIND_USER self-query
+  pub let SYS_STAT                 : u64 = 4     // v1.1-A path-based stat (mv.ENH-004 dst-exists probe)
 
   // ==========================================================================
   // PdxFS TXN mode ordinals (mirror kind_pdxfs_txn.pdx L88).
@@ -477,6 +478,57 @@ module Pdxfs = structure {
       justification: "mv.M2-004 (#7): sys_user_self trampoline. M2 STUB returns 1 (matching pdxfs_inode_owner's stub so the same-user branch fires). R48 body: `mov rax, 528; syscall; ret`. Arity 0. Leaf; sysreg for future syscall clobber. R48.M1 KIND_USER substrate at paideia-os src/kernel/core/cap/kind_user.pdx documents the self-query semantics.",
       block: {
         mov rax, 1;                            // STUB: invoker is user 1
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_dst_exists(path_ptr) -> u64
+  //
+  // mv.ENH-004 (paideia-os/mv#20): destination-clobber probe.
+  //
+  // Return contract:
+  //   0            -- path does NOT exist (or lookup refused; conservative
+  //                   fall-through so `mv src new_dst` still works in stub
+  //                   configurations where a real stat is not wired).
+  //   >0           -- path exists; the guard in Move::move_dispatch refuses
+  //                   the move unless -f / --force is set.
+  //   (negative errno never returned by the M2 STUB.)
+  //
+  // Rationale for a NEW trampoline instead of reusing Pdxfs::pdxfs_inode_of:
+  // pdxfs_inode_of is an M2 STUB that returns 1 unconditionally so callers
+  // downstream see a "valid inode" they can pass to pdxfs_link. Wiring the
+  // dst-exists guard onto that stub would refuse every move in stub
+  // configurations, breaking the M4 fixtures (test_smoke / test_txn_abort)
+  // that thread valid pointers through move_dispatch and expect success.
+  // A dedicated probe trampoline preserves the M4 stub-driven pass rate
+  // while making the R42 body-swap a one-line edit (sys_stat sysno 4; the
+  // v1.1-A path-based stat that landed alongside sys_rename / sys_unlink at
+  // R56.M3-005 -- see paideia-os design/user/syscall-table.md).
+  //
+  // R42 body sketch:
+  //   sub rsp, 40;                    // struct stat scratch (kernel writes here)
+  //   mov rsi, rsp;                   // out_stat
+  //   mov rax, 4;                     // SYS_STAT
+  //   syscall;
+  //   add rsp, 40;
+  //   cmp rax, 0;
+  //   jl  mv_dx_noent;                // negative errno = ENOENT / EACCES => 0
+  //   mov rax, 1;
+  //   ret;
+  // mv_dx_noent:
+  //   xor rax, rax;
+  //   ret;
+  //
+  // Leaf; no callee-save touched. sysreg effect declared for the R42
+  // body-edit's SYSRET rcx/r11 clobber (M2 STUB body issues no syscall).
+  // ==========================================================================
+  pub let pdxfs_dst_exists : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv.ENH-004 (#20): pdxfs_dst_exists trampoline -- destination-clobber probe for Move::move_dispatch's dst-exists guard. M2 STUB returns 0 (destination does not exist) so the M4 stub-driven fixtures (test_smoke, test_txn_abort) that thread valid path pointers through move_dispatch continue to reach the success arm. R42 body-edit uses sys_stat (sysno 4; landed at R56.M3-005 alongside sys_rename / sys_unlink -- paideia-os design/user/syscall-table.md) with a 40-byte scratch on stack for the kernel's struct stat write; negative errno (ENOENT/EACCES) folds to 0 (does-not-exist), success folds to 1 (exists). A dedicated probe (not pdxfs_inode_of, which stubs to 1 always) preserves stub-driven test pass rates while making the R42 swap a one-line body edit. Leaf; sysreg for future SYSRET clobber. r11 unused (leaf, no .bss reach). Arity 1, no r10 shuffle. Labels prefixed mv_dx_ (reserved for the R42 body edit).",
+      block: {
+        xor rax, rax;                          // STUB: dst does not exist
         ret
       }
     }

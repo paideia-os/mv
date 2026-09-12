@@ -19,6 +19,7 @@
 //      every observed flag name against the mv whitelist:
 //        "v" / "verbose"  → mv_argv_verbose = 1  (mv.ENH-006, #22)
 //        "i"              → mv_argv_interactive = 1
+//        "f" / "force"    → mv_argv_force = 1    (mv.ENH-004, #20)
 //        "dry-run"        → mv_argv_dry_run = 1
 //      Any other name → MV_ARG_UNKNOWN_FLAG, with the offending
 //      flag_names index recorded to mv_argv_error_flag_index for
@@ -89,6 +90,7 @@ module Argv = structure {
   pub let mut mv_argv_verbose           : u64 = uninit @align(8)   // -v seen
   pub let mut mv_argv_interactive       : u64 = uninit @align(8)   // -i seen
   pub let mut mv_argv_dry_run           : u64 = uninit @align(8)   // --dry-run seen
+  pub let mut mv_argv_force             : u64 = uninit @align(8)   // -f / --force seen (mv.ENH-004, #20)
   pub let mut mv_argv_error_flag_index  : u64 = uninit @align(8)   // libpdx-argv index of offending flag
 
   // ==========================================================================
@@ -101,7 +103,7 @@ module Argv = structure {
   pub let mv_argv_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mv.M1-002 (#2): zero the six mv_argv_* slots so mv_argv_parse starts empty. xor rax,rax; six lea+mov to each slot. Same idiom as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. r11 is scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      justification: "mv.M1-002 (#2) + mv.ENH-004 (#20): zero the seven mv_argv_* slots so mv_argv_parse starts empty (ENH-004 widened the reset from six to seven slots to cover the new mv_argv_force flag). xor rax,rax; seven lea+mov to each slot. Same idiom as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. r11 is scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
       block: {
         xor rax, rax;
         lea r11, [rip + mv_argv_src];              mov [r11], rax;
@@ -109,6 +111,7 @@ module Argv = structure {
         lea r11, [rip + mv_argv_verbose];          mov [r11], rax;
         lea r11, [rip + mv_argv_interactive];      mov [r11], rax;
         lea r11, [rip + mv_argv_dry_run];          mov [r11], rax;
+        lea r11, [rip + mv_argv_force];            mov [r11], rax;
         lea r11, [rip + mv_argv_error_flag_index]; mov [r11], rax;
         ret
       }
@@ -232,11 +235,31 @@ module Argv = structure {
 
       mv_ap_try_i:
         // Try "i": byte0 == 'i' (0x69), byte1 == NUL.
-        xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x69; jne mv_ap_try_dry_run;
-        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    jne mv_ap_try_dry_run;
+        xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x69; jne mv_ap_try_f;
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    jne mv_ap_try_f;
         // Match "i" -> mv_argv_interactive = 1.
         mov rax, 1;
         lea r11, [rip + mv_argv_interactive];
+        mov [r11], rax;
+        jmp mv_ap_flag_next;
+
+      mv_ap_try_f:
+        // mv.ENH-004 (#20): try "f" or "force". byte0 == 'f' (0x66) is
+        // shared by both. Disambiguate on byte1: NUL for short "f",
+        // 'o' for long "force".
+        xor rax, rax; mov_b rax, [r15 + 0]; cmp rax, 0x66; jne mv_ap_try_dry_run;
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0;    je  mv_ap_match_f;
+        xor rax, rax; mov_b rax, [r15 + 1]; cmp rax, 0x6F; jne mv_ap_unknown_flag;  // 'o'
+        xor rax, rax; mov_b rax, [r15 + 2]; cmp rax, 0x72; jne mv_ap_unknown_flag;  // 'r'
+        xor rax, rax; mov_b rax, [r15 + 3]; cmp rax, 0x63; jne mv_ap_unknown_flag;  // 'c'
+        xor rax, rax; mov_b rax, [r15 + 4]; cmp rax, 0x65; jne mv_ap_unknown_flag;  // 'e'
+        xor rax, rax; mov_b rax, [r15 + 5]; cmp rax, 0;    jne mv_ap_unknown_flag;  // NUL
+        // Matched "force" -- fall through to the same store as "f".
+
+      mv_ap_match_f:
+        // Match "f" / "force" -> mv_argv_force = 1.
+        mov rax, 1;
+        lea r11, [rip + mv_argv_force];
         mov [r11], rax;
         jmp mv_ap_flag_next;
 
