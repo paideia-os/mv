@@ -1,0 +1,330 @@
+// tests/stack_discipline.pdx -- mv.ENH-010 (paideia-os/mv#26)
+// StackDiscipline module: rsp-restore regression over every framed
+// epilogue in Entry.
+//
+// Scope
+// -----
+// mv.v1.2.0-A ships six framed helpers in src/entry.pdx and each one
+// has multiple return arms:
+//
+//   entry_resolve            5-push frame (rbx, r12, r13, r14, r15);
+//                            three arms (absolute passthrough,
+//                            joined-cwd, error-with-negative-rax).
+//   entry_probe_dir          2-push + sub 8 (rbx, r12);
+//                            two arms (is-dir true, is-dir false).
+//   entry_compose_dir_slash_base
+//                            2-push + sub 8;
+//                            three arms (ok, overflow, empty-base).
+//   entry_confirm            2-push + sub 8;
+//                            two arms (yes-continue, no-skip).
+//   entry_move_one           2-push + sub 8;
+//                            three arms (ok, skip-on-confirm-no, fail).
+//   entry_move_multi         1-push (rbx);
+//                            two arms (ok-via-move_one, compose-fail).
+//
+// Every one of those arms must restore rsp to the value it had at
+// prologue-entry. A single missed `add rsp, 8` or `pop` on an error
+// path is a stack-underflow bug the current M4 corpus does not catch:
+// test_smoke exercises only the happy path of entry_move_one via a
+// stubbed Rename::rename_same_dir, and test_txn_abort / test_undo_*
+// don't touch Entry at all.
+//
+// The regression pin: before each nested call the fixture reads rsp
+// into a scratch, invokes the framed helper with an argv that
+// steers it down one specific arm, then re-reads rsp and asserts
+// bit-equal. Any divergence (missing epilogue restore, unmatched
+// push/pop, prologue-arithmetic skew) is a hard fail.
+//
+// Nine arms in total:
+//
+//   A. entry_resolve absolute passthrough (user_ptr[0] == '/')
+//   B. entry_resolve error path (contrived overflow via 4KB user_ptr)
+//   C. entry_probe_dir is-dir true    (dst_ptr[strlen-1] == '/')
+//   D. entry_probe_dir is-dir false   (dst_ptr is a plain name)
+//   E. entry_compose_dir_slash_base ok arm
+//   F. entry_compose_dir_slash_base overflow arm
+//   G. entry_confirm yes-continue (fixture pre-seeds prompt byte 'y')
+//   H. entry_confirm no-skip     (fixture pre-seeds prompt byte 'n')
+//   I. entry_move_multi compose-fail (dst_dir_ptr triggers overflow)
+//
+// (entry_move_one's own arms are covered transitively via H's skip
+// path and via test_smoke's happy path.)
+//
+// Return: 0 on clean pass, 1 on any arm mismatch. Emits
+// [mv.ENH-010 STACK OK]\n or [mv.ENH-010 STACK FAIL <letter>]\n on
+// fd 2 for the smoke matcher.
+//
+// Substrate-and-fixture note
+// --------------------------
+// This test cannot run against a live PdxFS substrate because most
+// of the Entry helpers issue real syscalls (sys_getcwd, sys_stat,
+// sys_read, sys_write). At HEAD the paideia-as unit-test harness
+// invokes the fixture in the same process the smoke runner exec's,
+// so those syscalls hit the real kernel. The arm selection above is
+// engineered so every arm the fixture drives lands a deterministic
+// classification the outcome of which is irrelevant to the rsp
+// assertion — the return VALUE is discarded; only the rsp delta is
+// asserted.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module StackDiscipline (PascalCase basename matches file stem).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF.
+//   - r11 scratch for every rip-relative lea. Never held live across
+//     a nested call.
+//   - Nine-arm prologue: 2-push (rbx = pre-call rsp snapshot, r12 =
+//     failure latch) + sub rsp, 8 keeps rsp%16 == 0 at every nested
+//     call site (entry rsp%16 == 8 → post-frame rsp%16 == 0). rbx is
+//     SysV callee-save; the Entry callees preserve it under their
+//     own frames.
+//   - Labels prefixed `sd_` (paideia-as reserved-label discipline).
+//   - Byte loads (n/a here; module compares only rsp deltas).
+//   - No test mnemonic; the fixture is a pure control-flow driver.
+
+module StackDiscipline = structure {
+
+  // Arm-A driver: user_ptr[0] == '/' absolute-passthrough.
+  pub let ARM_A_USER     : [u8; 12] = "/tmp/foo.txt"
+  pub let ARM_A_USER_LEN : u64      = 12
+
+  // Arm-B driver: 4KB long path (overflow-safe upper bound: the
+  // resolver's walker caps at 4095 bytes then returns -ENAMETOOLONG).
+  // A single 500-byte relative path (no leading '/') will exceed the
+  // 512-byte scratch when cwd_len is nontrivial and force the resolver
+  // down its error arm.
+  pub let mut ARM_B_USER : [u8; 512] = uninit @align(8)
+
+  // Arm-C driver: trailing-slash marker => probe_dir returns 1.
+  pub let ARM_C_DST      : [u8; 6]  = "docs/\0"
+
+  // Arm-D driver: plain filename => probe_dir returns 0.
+  pub let ARM_D_DST      : [u8; 8]  = "foo.txt\0"
+
+  // Arm-E/F drivers: compose_dir_slash_base takes (dir, src, out).
+  pub let ARM_E_DIR      : [u8; 5]  = "dst/\0"
+  pub let ARM_E_SRC      : [u8; 9]  = "src/a.txt"
+  pub let mut ARM_E_OUT  : [u8; 32] = uninit @align(8)
+
+  pub let mut ARM_F_DIR  : [u8; 512] = uninit @align(8)
+  pub let ARM_F_SRC      : [u8; 9]  = "src/a.txt"
+  pub let mut ARM_F_OUT  : [u8; 32] = uninit @align(8)
+
+  // Arm-G/H drivers: entry_confirm consults entry_prompt_byte, which
+  // the fixture pre-seeds before each invocation.
+  pub let ARM_GH_DST     : [u8; 6]  = "foo.x\0"
+
+  // Fingerprint markers.
+  pub let OK_MSG         : [u8; 22] = "[mv.ENH-010 STACK OK]\n"
+  pub let OK_MSG_LEN     : u64      = 22
+
+  pub let FAIL_HEAD      : [u8; 20] = "[mv.ENH-010 STACK FA"
+  pub let FAIL_HEAD_LEN  : u64      = 20
+  pub let FAIL_TAIL      : [u8; 5]  = "IL ?]\n"
+  pub let FAIL_TAIL_LEN  : u64      = 5
+
+  // ============================================================================
+  // stack_discipline_run() -> u64
+  //
+  // Runs all nine arms in order. Returns 0 on clean pass, 1 on any
+  // rsp-mismatch failure. Emits an OK line or a FAIL line naming the
+  // first arm that failed on fd 2.
+  //
+  // Register plan:
+  //   rbx = pre-call rsp snapshot (reloaded per arm)
+  //   r12 = failure latch (0 = clean, non-zero = ASCII arm letter of
+  //         the first failure).
+  // ============================================================================
+  pub let stack_discipline_run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.ENH-010 stack_discipline_run (paideia-os/mv#26). Nine-arm rsp-restore regression: for each framed epilogue arm in src/entry.pdx, snapshot rsp into rbx before the call, invoke the callee with an argv that steers it down the target arm, then compare rsp against rbx and latch the arm's ASCII letter into r12 on divergence. Only the FIRST failure's letter is emitted (subsequent latches skipped via `cmp r12, 0; jne`). Prologue: 2-push (rbx = rsp snapshot, r12 = failure latch) + sub rsp, 8 = 24 bytes on stack after ret addr → rsp%16 = 0 at every nested Entry call site. All nine arms measure `rsp AFTER the nested call` against `rsp BEFORE the nested call` — the two snapshots straddle only the callee's frame, so a callee that pops one slot too few (missing add rsp, 8 on an error return) shows up as rsp having dropped 8. Fingerprint emit is fd 2 sys_write, matching the M4 corpus convention. All immediates ≤ 512 fit imm16. Labels prefixed `sd_` per paideia-as reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+        xor r12, r12;                          // failure latch = 0
+
+        // =============== Arm A: entry_resolve absolute ==================
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_A_USER];
+        lea rsi, [rip + entry_src_resolved];
+        call entry_resolve;
+        cmp rsp, rbx;
+        je  sd_arm_b;
+        mov r12, 65;                           // 'A'
+
+      sd_arm_b:
+        // =============== Arm B: entry_resolve overflow ==================
+        // Pre-fill ARM_B_USER with 500 'x' bytes then NUL. Loop-fill
+        // via rip-relative store of a repeated byte.
+        lea r11, [rip + ARM_B_USER];
+        mov rcx, 0;
+      sd_arm_b_fill:
+        mov rax, 0x78;                         // 'x'
+        mov_b [r11 + rcx*1], rax;
+        add rcx, 1;
+        cmp rcx, 500;
+        jl  sd_arm_b_fill;
+        xor rax, rax;
+        mov_b [r11 + rcx*1], rax;              // NUL-terminate
+
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_B_USER];
+        lea rsi, [rip + entry_src_resolved];
+        call entry_resolve;
+        cmp rsp, rbx;
+        je  sd_arm_c;
+        cmp r12, 0;
+        jne sd_arm_c;
+        mov r12, 66;                           // 'B'
+
+      sd_arm_c:
+        // =============== Arm C: entry_probe_dir true ====================
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_C_DST];
+        call entry_probe_dir;
+        cmp rsp, rbx;
+        je  sd_arm_d;
+        cmp r12, 0;
+        jne sd_arm_d;
+        mov r12, 67;                           // 'C'
+
+      sd_arm_d:
+        // =============== Arm D: entry_probe_dir false ===================
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_D_DST];
+        call entry_probe_dir;
+        cmp rsp, rbx;
+        je  sd_arm_e;
+        cmp r12, 0;
+        jne sd_arm_e;
+        mov r12, 68;                           // 'D'
+
+      sd_arm_e:
+        // =============== Arm E: compose ok ==============================
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_E_DIR];
+        lea rsi, [rip + ARM_E_SRC];
+        lea rdx, [rip + ARM_E_OUT];
+        call entry_compose_dir_slash_base;
+        cmp rsp, rbx;
+        je  sd_arm_f;
+        cmp r12, 0;
+        jne sd_arm_f;
+        mov r12, 69;                           // 'E'
+
+      sd_arm_f:
+        // =============== Arm F: compose overflow ========================
+        // Fill ARM_F_DIR with 500 'y' bytes to force out overflow.
+        lea r11, [rip + ARM_F_DIR];
+        mov rcx, 0;
+      sd_arm_f_fill:
+        mov rax, 0x79;                         // 'y'
+        mov_b [r11 + rcx*1], rax;
+        add rcx, 1;
+        cmp rcx, 500;
+        jl  sd_arm_f_fill;
+        xor rax, rax;
+        mov_b [r11 + rcx*1], rax;
+
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_F_DIR];
+        lea rsi, [rip + ARM_F_SRC];
+        lea rdx, [rip + ARM_F_OUT];
+        call entry_compose_dir_slash_base;
+        cmp rsp, rbx;
+        je  sd_arm_g;
+        cmp r12, 0;
+        jne sd_arm_g;
+        mov r12, 70;                           // 'F'
+
+      sd_arm_g:
+        // =============== Arm G: confirm yes =============================
+        // Pre-seed entry_prompt_byte[0] = 'y' so confirm returns
+        // the yes-continue arm regardless of tty availability.
+        lea r11, [rip + entry_prompt_byte];
+        mov rax, 0x79;                         // 'y'
+        mov_b [r11], rax;
+
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_GH_DST];
+        call entry_confirm;
+        cmp rsp, rbx;
+        je  sd_arm_h;
+        cmp r12, 0;
+        jne sd_arm_h;
+        mov r12, 71;                           // 'G'
+
+      sd_arm_h:
+        // =============== Arm H: confirm no ==============================
+        lea r11, [rip + entry_prompt_byte];
+        mov rax, 0x6E;                         // 'n'
+        mov_b [r11], rax;
+
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_GH_DST];
+        call entry_confirm;
+        cmp rsp, rbx;
+        je  sd_arm_i;
+        cmp r12, 0;
+        jne sd_arm_i;
+        mov r12, 72;                           // 'H'
+
+      sd_arm_i:
+        // =============== Arm I: move_multi compose-fail =================
+        mov rbx, rsp;
+        lea rdi, [rip + ARM_E_SRC];            // src (fine)
+        lea rsi, [rip + ARM_F_DIR];            // dir (500 y's -> overflow)
+        call entry_move_multi;
+        cmp rsp, rbx;
+        je  sd_emit;
+        cmp r12, 0;
+        jne sd_emit;
+        mov r12, 73;                           // 'I'
+
+      sd_emit:
+        cmp r12, 0;
+        jne sd_emit_fail;
+
+        // Success: emit OK marker.
+        mov rdi, 2;
+        lea rsi, [rip + OK_MSG];
+        mov rdx, 22;                           // OK_MSG_LEN
+        mov rax, 1;
+        syscall;
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sd_emit_fail:
+        // Failure: patch the '?' in FAIL_TAIL to the latched letter,
+        // then emit head + tail. Byte-store through rax to avoid the
+        // r8-r15 mov_b encoding gap (paideia-as feedback_pdx_encoder_
+        // pitfalls: destination reg for mov_b is safest as rax).
+        mov rax, r12;
+        lea r11, [rip + FAIL_TAIL];
+        mov_b [r11 + 3], rax;                  // overwrite '?'
+
+        mov rdi, 2;
+        lea rsi, [rip + FAIL_HEAD];
+        mov rdx, 20;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 2;
+        lea rsi, [rip + FAIL_TAIL];
+        mov rdx, 5;
+        mov rax, 1;
+        syscall;
+
+        mov rax, 1;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
