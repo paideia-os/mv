@@ -1,0 +1,254 @@
+// src/elevate_gate.pdx -- mv LE-001 (paideia-os/mv#29)
+//
+// ElevateGate module: cross-subtree elevate acquire+require+derive+
+// cascade scaffolding for moves that cross a per-user-subtree
+// boundary.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv's existing src/elevate.pdx (M3-004, #11) implements a single,
+// narrow HINT hop -- a hand-rolled 32-byte ElevateRequest record sent
+// straight to svc.elevate-broker via Audit's shared svc_lookup +
+// ipc_send transport -- written when libpdx-elevate was "not yet
+// in-tree" (see that file's own SUBSTRATE STATE section). That is no
+// longer true: libpdx-elevate has since landed the full LE.M1..M7
+// surface (ENH-001..ENH-003, LE.M1-002, LE.M3, LE.M5, LE.M7-001/002),
+// including exactly the four entry points this issue names:
+//
+//   ElevateClientAcquire::elevate_client_acquire(caps, dur, req_buf,
+//     reply_ep_id, reply_buf, mint_ctx_buf) -> row_id (<16) | error
+//   ElevateClientRequire::elevate_client_require(row_id, needed_caps)
+//     -> ELCA_OK (0) | ELCA_ERR_EXPIRED | ELCA_ERR_CAPS_INSUFFICIENT
+//   ElevateClientCap::elevate_client_cap_derive(parent_row,
+//     child_caps, ...) -> child_row_id | ELCC_ERR_*
+//   ElevateClientCap::elevate_client_cap_revoke_cascade(row_id)
+//     -> revoked_count | ELCC_ERR_CASCADE_FAIL
+//
+// This module gives mv a SECOND, independent gate: rather than the
+// M3-004 hint (borrow a signing key for inode-owner rebind), LE-001
+// asks "does THIS move cross a subtree boundary at all, and if so,
+// has the caller's cap_table proven it may act across that boundary
+// before the outer TXN even opens" -- a structural pre-flight check,
+// not a rebind-time hint. mv_elevate_gate_run is intended to be
+// called from Move::move_dispatch immediately BEFORE Step 4
+// (pdxfs_txn_open) once wired -- see "CALL-SITE WIRING STATUS" below,
+// which mirrors mv#31's own honest deferral posture.
+//
+// =============================================================================
+// WHY THE FOUR REAL CALLS ARE NOT ACTUALLY ISSUED AT THIS LANDING
+// =============================================================================
+//
+// mkfs.pdxfs's OWN LE-001 landing (paideia-os/mkfs.pdxfs#26,
+// src/elevate_wire.pdx) did this exact investigation first and found
+// TWO blockers. The first -- no `elevate_client_acquire`-shaped API
+// -- is resolved (see above). The second is NOT, and it applies to mv
+// identically:
+//
+//   `elevate_client_acquire`'s `mint_ctx_buf` (elevate_client_acquire
+//   .pdx header, "mint_ctx_buf LAYOUT") requires a `parent_ep_slot`
+//   at offset +0: "cap-table slot of the caller's KIND_IPC_ENDPOINT
+//   cap over the broker (NOT the bare endpoint_id
+//   elevate_client_lookup_broker returns)". mv, like mkfs.pdxfs /
+//   mount.pdxfs / umount.pdxfs, has no endpoint-MINT call site
+//   anywhere in its own tree -- mv's existing Elevate::mv_elevate_
+//   endpoint (elevate.pdx) and Audit::svc_lookup both resolve a bare
+//   endpoint_id via sys_svc_lookup, never a cap-table SLOT. There is
+//   no honest non-zero/valid value this module can supply for
+//   parent_ep_slot today.
+//
+// A second-order consequence: mv's own tools/build.sh (per-file
+// `paideia-as build --emit elf64`, no link step -- see
+// tools/build.sh's own header) never actually links this file's
+// object against libpdx-elevate's, so a bare `call
+// elevate_client_acquire` here would not even be caught as an
+// undefined-symbol error by mv's own build; it would only surface
+// (or not) whenever this repo's objects are eventually linked into a
+// real image. Emitting an unresolvable, unverifiable `call` under
+// those conditions -- with no build available at this landing
+// (IMPL-ONLY) -- is not the responsible choice paideia-os/mkfs.pdxfs
+// #26 already modeled. This module therefore follows the SAME
+// resolution: real signatures documented verbatim (mirrored above),
+// scaffolding built (cross-subtree detection, the four-step ORDER,
+// the .bss layout a future real wire would populate), but the actual
+// acquire/require/derive/cascade calls are WEAK STUBS that return
+// success -- callers thread the shape today; the R90-XREPO follow-up
+// that provisions a real parent_ep_slot (an endpoint-mint call site
+// shared across mv/mkfs.pdxfs/mount.pdxfs/umount.pdxfs, likely a
+// libpdx-elevate ENH itself) is a body-edit of the four MV_ELVG_*_stub
+// blocks below, not a restructure of mv_elevate_gate_run or its
+// call site.
+//
+// =============================================================================
+// CROSS-SUBTREE DETECTION (fully real, no blocker)
+// =============================================================================
+//
+// "First 2 path segments differ" -- walk both src and dst byte-for-
+// byte from index 0; the moment the bytes differ, the paths are
+// cross-subtree (a differing byte before either path's 2nd `/` or
+// its NUL terminator is itself proof the first-two-segments prefix
+// differs); the moment both bytes are simultaneously NUL, the paths
+// match through however many segments the shorter one has (same
+// subtree, or one is a prefix of the other -- treated as same-
+// subtree, matching mv's existing same-parent-dir collapse
+// convention in caps.decl); the moment the shared prefix has matched
+// through a 2nd `/` on both sides, stop and report same-subtree
+// (`/home/alice/x` and `/home/alice/y` -- both segments are
+// `/home/`, so they are the SAME subtree regardless of what follows).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ElevateGate`; file basename
+//     `elevate_gate.pdx`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Byte loads use the `xor r9, r9; mov_b r9, [ptr + rcx]` idiom
+//     (paideia-as #1248 mitigation, same as rn_strlen / Pipe::
+//     pipe_fnv1a64).
+//   - No `and rN, imm64` on r8-r15; no `imul`; no `neg`; no byte-
+//     register aliases; no Intel `qword ptr` / `dword ptr` forms.
+//   - `mv_elevate_gate_cross_subtree` is a LEAF (single loop, no
+//     CALLs). `mv_elevate_gate_run` makes ONE nested call (to
+//     mv_elevate_gate_cross_subtree) -- `sub rsp, 8` aligns rsp for
+//     it (entry rsp%16==8, sub 8 -> 0), matching Schema::mv_schema_
+//     emit's own single-nested-call alignment idiom.
+//   - Reserved-label discipline: labels prefixed `elvg_`.
+
+module ElevateGate = structure {
+
+  // ==========================================================================
+  // Status / diagnostic codes (0xFFFFEB84..0xFFFFEB8F -- next free
+  // slice after Elevate::MV_ELV_DENIED = 0xFFFFEB83 in STATUS.md's
+  // fingerprint table; ElevateGate's own band, kept adjacent to but
+  // disjoint from Elevate's 0xFFFFEB8x codes so a diagnostic
+  // immediately shows which module raised it).
+  // ==========================================================================
+  pub let MV_ELVG_OK          : u64 = 0
+  pub let MV_ELVG_SAME_SUBTREE : u64 = 0
+  pub let MV_ELVG_CROSS_SUBTREE : u64 = 1
+  pub let MV_ELVG_STUB         : u64 = 0xFFFFEB84   // acquire/require/derive/
+                                                     // cascade sequence ran as
+                                                     // a WEAK success stub --
+                                                     // see module header
+
+  // ==========================================================================
+  // mv_elevate_gate_cross_subtree(src_ptr, dst_ptr) -> 0 | 1
+  //
+  // RDI (input): src_ptr -- NUL-terminated source path.
+  // RSI (input): dst_ptr -- NUL-terminated destination path.
+  // RAX (output): MV_ELVG_SAME_SUBTREE (0) or MV_ELVG_CROSS_SUBTREE
+  //               (1) -- see module header for the exact rule.
+  //
+  // Single loop, byte-for-byte comparison with an independent
+  // running slash-count; returns the moment a mismatch, a joint NUL,
+  // or a joint 2nd-slash is found. Leaf: no CALLs, no push/pop
+  // parity to preserve.
+  //
+  // Register plan: rdi = src_ptr (preserved, only indexed), rsi =
+  // dst_ptr (preserved, only indexed), rcx = index i, r10 = slash
+  // count, rax = src byte temp, r9 = dst byte temp.
+  // ==========================================================================
+  pub let mv_elevate_gate_cross_subtree : (u64, u64) -> u64 !{mem} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv LE-001 (#29): mv_elevate_gate_cross_subtree -- byte-for-byte first-two-path-segments comparator. Single loop over index rcx: load src byte into rax and dst byte into r9 via the `xor rX,rX; mov_b rX,[ptr+rcx]` idiom (paideia-as #1248 mitigation, same pattern as rn_strlen in rename.pdx and Pipe::pipe_fnv1a64 in pipe.pdx); `cmp rax, r9; jne elvg_xs_cross` catches any divergence immediately (this also correctly handles the case where one path's NUL(0) lines up against the other's non-NUL byte, since 0 never equals a real path byte); `cmp rax, 0; je elvg_xs_same` catches the case both strings terminate together with an identical prefix (a full match, or one is a prefix of the other -- both treated as same-subtree, matching caps.decl's same-parent-dir collapse convention); `cmp rax, 0x2F; jne elvg_xs_next; add r10, 1; cmp r10, 2; je elvg_xs_same` counts '/' occurrences and stops the instant BOTH paths have matched through a 2nd slash, regardless of what follows -- '/home/alice/x' and '/home/alice/y' both stop here as same-subtree. Leaf: no CALLs, no callee-save touched (rdi/rsi are only ever indexed via [ptr+rcx], never overwritten). Every `cmp reg, imm` uses imm in {0, 0x2F, 2} -- all well inside imm32. No test mnemonic anywhere. Labels prefixed elvg_xs_ (ElevateGate cross-subtree) to dodge reserved words.",
+      block: {
+        xor rcx, rcx;                         // i = 0
+        xor r10, r10;                         // slash_count = 0
+      elvg_xs_loop:
+        xor rax, rax;
+        mov_b rax, [rdi + rcx];               // src byte
+        xor r9, r9;
+        mov_b r9, [rsi + rcx];                // dst byte
+        cmp rax, r9;
+        jne elvg_xs_cross;
+        cmp rax, 0;
+        je  elvg_xs_same;
+        cmp rax, 0x2F;                        // '/'
+        jne elvg_xs_next;
+        add r10, 1;
+        cmp r10, 2;
+        je  elvg_xs_same;
+      elvg_xs_next:
+        add rcx, 1;
+        jmp elvg_xs_loop;
+      elvg_xs_same:
+        xor rax, rax;                         // MV_ELVG_SAME_SUBTREE
+        ret;
+      elvg_xs_cross:
+        mov rax, 1;                           // MV_ELVG_CROSS_SUBTREE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mv_elevate_gate_run(src_ptr, dst_ptr) -> 0 | MV_ELVG_STUB
+  //
+  // RDI (input): src_ptr -- NUL-terminated source path.
+  // RSI (input): dst_ptr -- NUL-terminated destination path.
+  // RAX (output): 0 when the move is same-subtree (no elevate gate
+  //               needed) or when the cross-subtree stub sequence
+  //               ran (see module header -- the stub always
+  //               "succeeds" by design, fail-open until the real
+  //               wire lands, matching Pdxfs's own M2-era stub
+  //               posture).
+  //
+  // Calls mv_elevate_gate_cross_subtree; on MV_ELVG_CROSS_SUBTREE,
+  // runs the four-step acquire -> require -> derive -> cascade
+  // sequence IN ORDER (each step documented at its stub call site
+  // below) before returning. Intended call site: Move::move_dispatch,
+  // immediately before Step 4 (pdxfs_txn_open) -- see "CALL-SITE
+  // WIRING STATUS" in the module header for why that insertion is
+  // deferred to a follow-up issue (same posture as mv#31's Pipe
+  // module).
+  // ==========================================================================
+  pub let mv_elevate_gate_run : (u64, u64) -> u64 !{mem} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv LE-001 (#29): mv_elevate_gate_run -- cross-subtree pre-flight gate. `sub rsp, 8` aligns rsp for the single nested call (entry rsp%16==8, sub 8 -> 0), matching Schema::mv_schema_emit's own single-nested-call alignment idiom (no callee-save pushes needed: src_ptr/dst_ptr are not read again after the cross_subtree call, and the four elvg_run_step_* stub blocks touch no live caller state). On MV_ELVG_SAME_SUBTREE (0) jumps straight to elvg_run_same, returning MV_ELVG_OK (0). On MV_ELVG_CROSS_SUBTREE (1) falls through elvg_run_step_acquire / _require / _derive / _cascade in strict program order -- each is a documentation-only label (see module header's blocker writeup for why no real libpdx-elevate symbol is referenced) -- then sets rax = MV_ELVG_STUB (0xFFFFEB84, distinct from MV_ELVG_OK) and jumps to elvg_run_done, signalling 'the cross-subtree sequence ran as a fail-open stub' to a future caller/diagnostic without conflating it with the ordinary same-subtree no-op path. No real libpdx-elevate symbol is referenced anywhere in this function, so mv's own per-file build.sh has nothing unresolved to fail on. `add rsp, 8` restores the alignment pad before `ret`. Every `cmp reg, imm` uses imm 0 (fits imm32). No test mnemonic.",
+      block: {
+        sub rsp, 8;
+        call mv_elevate_gate_cross_subtree;
+        cmp rax, 0;
+        je  elvg_run_same;
+
+        // ---- Step 1: acquire (WEAK stub -- see module header) ------
+        // Real target: ElevateClientAcquire::elevate_client_acquire(
+        //   caps, dur, req_buf, reply_ep_id, reply_buf, mint_ctx_buf)
+        //   -> row_id (<16) | error.
+      elvg_run_step_acquire:
+
+        // ---- Step 2: require (WEAK stub) ---------------------------
+        // Real target: ElevateClientRequire::elevate_client_require(
+        //   row_id, needed_caps) -> ELCA_OK (0) | ELCA_ERR_*.
+      elvg_run_step_require:
+
+        // ---- Step 3: derive (WEAK stub) -----------------------------
+        // Real target: ElevateClientCap::elevate_client_cap_derive(
+        //   parent_row, child_caps, ...) -> child_row_id | ELCC_ERR_*.
+      elvg_run_step_derive:
+
+        // ---- Step 4: revoke_cascade (WEAK stub) ---------------------
+        // Real target: ElevateClientCap::elevate_client_cap_
+        //   revoke_cascade(row_id) -> revoked_count | ELCC_ERR_
+        //   CASCADE_FAIL. Called at the TAIL of the gate (not after
+        //   the move) ONLY to prove the four-call ORDER this issue
+        //   asks for; a real wire would move this call to mv's post-
+        //   move cleanup path instead (revoking the borrowed row
+        //   after the TXN commits, not before it opens) -- flagged
+        //   here rather than silently landing a wrong call order.
+      elvg_run_step_cascade:
+        mov rax, 0xFFFFEB84;                  // MV_ELVG_STUB
+        jmp elvg_run_done;
+
+      elvg_run_same:
+        xor rax, rax;                         // MV_ELVG_OK
+
+      elvg_run_done:
+        add rsp, 8;
+        ret
+      }
+    }
+}

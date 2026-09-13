@@ -7,6 +7,70 @@ and the issues each entry closes.
 
 ---
 
+## 1.3.0 — 2026-09-13 (R90-XREPO wave-C cohort)
+
+Closes paideia-os/mv#28. Closes paideia-os/mv#29. Closes paideia-os/mv#31.
+Closes paideia-os/mv#32. Closes paideia-os/mv#33. Closes paideia-os/mv#34.
+
+Reconciles mv onto the REAL landed R90-XREPO.010 PdxFS v1 TXN substrate
+(sysnos 70/104/105/106/107, `design/kernel/pdxfs-syscalls.md` §3) and the
+R107-M0-001 `sys_semantic_send` producer ring (sysno 115) cp already
+adopted (cp#33). Six issues, additive only — no existing call site's
+control flow changes.
+
+- `caps.decl` (mv#28): R90-XREPO.010 substrate adoption note added;
+  the existing six-capability `requires:` list already covered
+  everything this issue asked for (KIND_USER, KIND_IPC_ENDPOINT,
+  KIND_PDXFS_FILE x2, KIND_PDXFS_TXN, KIND_ELEVATE_CHANNEL) — no new
+  cap row. `declares_output_schemas:` now names `MoveRecord@0.2` in
+  place of the M1-era `(none)`.
+- `src/elevate_gate.pdx` (mv#29, LE-001): new `ElevateGate` module.
+  `mv_elevate_gate_cross_subtree` is a real, fully-implemented
+  first-two-path-segments comparator. `mv_elevate_gate_run` documents
+  the real `elevate_client_acquire` / `elevate_client_require` /
+  `elevate_client_cap_derive` / `elevate_client_cap_revoke_cascade`
+  call signatures (all four now exist in libpdx-elevate, unlike at
+  mv's earlier M3-004 landing) but runs them as a WEAK success stub —
+  mv has no cap-table `parent_ep_slot` to honestly populate
+  `elevate_client_acquire`'s `mint_ctx_buf`, the identical blocker
+  paideia-os/mkfs.pdxfs#26's own LE-001 landing already documented.
+  New status code `MV_ELVG_STUB = 0xFFFFEB84`. Not yet wired into
+  `Move::move_dispatch`.
+- `src/pipe.pdx` (mv#31, v1.1-B): new `Pipe` module.
+  `pipe_emit_move_record` emits a real `MoveRecord@0.2` (120 bytes
+  populated / 128-byte buffer: packed version+op, seeded-FNV-1a64
+  src/dst path-hash pairs, bytes_moved, rdtsc timestamp, 64B
+  reserved) via `sys_semantic_send` (sysno 115), mirroring cp's own
+  `pipe_emit_copy_record` (cp#33) shape exactly. `pipe_fnv1a64` is a
+  new seeded FNV-1a 64-bit hash helper. Not yet wired into
+  `Move::move_dispatch`'s success tail (deferred, same posture as
+  cp#31/cp#35's own declaration/adoption split).
+- `src/move_schema.pdx` (mv#33): new `MoveSchema` module. Publishes
+  `move_record_ddl` (a compact single-line DDL string describing the
+  MoveRecord@0.2 field shape) and `MOVE_RECORD_SCHEMA_ID =
+  0xE0604D560002`, numerically identical to `Pipe::MOVE_RECORD_
+  SCHEMA` so a consumer can resolve the wire schema tag without
+  reading pipe.pdx's asm.
+- `src/pdxfs_txn.pdx` (mv#34): new `PdxfsTxn` module. Wires
+  `pdxfs_txn_begin` / `pdxfs_txn_add_rename` / `pdxfs_txn_add_unlink`
+  / `pdxfs_txn_add_write` / `pdxfs_txn_commit` / `pdxfs_txn_abort` /
+  `pdxfs_txn_status` / `pdxfs_txn_free` against the REAL R90-XREPO.010
+  dispatch table (sysno 70 = txn_open, 104 = txn_commit, 105 =
+  txn_abort, 107 = undo_write) rather than the issue's own literal
+  (and incorrect — cross-checked against `design/kernel/pdxfs-
+  syscalls.md` §3 and cp's own already-landed adoption) sysno list.
+  The three `add_*` wrappers all route to the one real
+  `sys_pdxfs_undo_write` via a 40-byte descriptor page (paideia-as
+  caps unsafe-bodied `fn` at 4 curried args). `pdxfs_txn_status` /
+  `pdxfs_txn_free` are honest STUBs — no `sys_pdxfs_txn_status` or
+  `sys_pdxfs_txn_close` exists in the landed substrate yet. Does not
+  replace `src/pdxfs.pdx`'s existing M2-001 stub band (512-521);
+  `Move::move_dispatch`'s migration onto this module is deferred.
+- `manifest.pdxsig`, `README.md`, `STATUS.md` (mv#32): version/tag
+  bumped to 1.3.0, wave relabeled `R90-XREPO` / `wave-C`, new
+  artifact + schema stanzas for the four new source files and
+  `MoveRecord@0.2`.
+
 ## 1.2.0 — 2026-09-13 (Wave-C consolidation)
 
 Real-body entry point, POSIX multi-source form, cwd-relative operand

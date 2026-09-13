@@ -22,14 +22,14 @@
 
 [package]
 name          = mv
-version       = 1.2.0
-wave          = R50
-milestone     = M5
+version       = 1.3.0
+wave          = R90-XREPO
+milestone     = wave-C
 category      = A/coreutils
 priority      = P0
 license       = MIT
 repository    = https://github.com/paideia-os/mv
-tag           = v1.2.0
+tag           = v1.3.0
 authored_by   = paideia-os-team
 released      = 2026-09-13
 
@@ -79,6 +79,10 @@ src/elevate.pdx  = pending:src-elevate-blake3-256
 src/verbose.pdx  = pending:src-verbose-blake3-256
 src/pdxfs.pdx    = pending:src-pdxfs-blake3-256
 src/entry.pdx    = pending:src-entry-blake3-256
+src/elevate_gate.pdx = pending:src-elevate-gate-blake3-256
+src/pdxfs_txn.pdx    = pending:src-pdxfs-txn-blake3-256
+src/move_schema.pdx  = pending:src-move-schema-blake3-256
+src/pipe.pdx         = pending:src-pipe-blake3-256
 
 [schemas]
 # Semantic-pipe schemas mv emits (D2). Bound at M3-001 in src/schema.pdx.
@@ -86,6 +90,11 @@ src/entry.pdx    = pending:src-entry-blake3-256
 # pre-M3 placeholder (schema id 0x4D56, 64 bytes) that was never
 # updated to match the M3-001 implementation.
 MoveRecord = 0xFFFFEB5000000002  # 88 bytes; schema v2 adds dst_existed at offset 80 (mv.ENH-004, #20)
+
+# v1.3.0 (mv#31/mv#33): real sys_semantic_send (sysno 115) emission,
+# additive to the fd-1 stub blob above (Schema module, unchanged).
+# See src/pipe.pdx + src/move_schema.pdx.
+MoveRecord@0.2 = 0xE0604D560002  # 120 bytes populated / 128-byte buffer; via sys_semantic_send
 
 [undo]
 # PdxFS v1 undo record shape threaded by Undo::mv_undo_write on commit

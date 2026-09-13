@@ -134,6 +134,22 @@ The emit is best-effort from `move_dispatch`'s perspective: a short write
 `MV_ST_ERRORS` but does not gate the commit. Success bumps
 `MV_ST_RECORDS_EMITTED` (stats slot 11).
 
+### v1.3.0 — MoveRecord@0.2 via `sys_semantic_send` (mv#31/mv#33)
+
+Additive to the fd-1 stub blob above: `Pipe::pipe_emit_move_record`
+(`src/pipe.pdx`) emits a second, real record — `MoveRecord@0.2`, 120 bytes
+populated in a 128-byte buffer — through the kernel-side `sys_semantic_send`
+producer ring (sysno 115, R107-M0-001 #2350), the same substrate cp's own
+`pipe_emit_copy_record` (cp#33) uses. The record carries `version`/`op`
+(packed into one `u64`), a seeded-FNV-1a64 `(src_hash_lo, src_hash_hi)` /
+`(dst_hash_lo, dst_hash_hi)` path-fingerprint pair, `bytes_moved` (0 for a
+same-device rename; the cross-device byte count otherwise), and an `rdtsc`
+`timestamp`. The field shape is published independently as a schema
+fingerprint in `src/move_schema.pdx` (`MoveSchema::move_record_ddl` +
+`MOVE_RECORD_SCHEMA_ID = 0xE0604D560002`). **Not yet wired** into
+`Move::move_dispatch`'s success tail — see `src/pipe.pdx`'s own header for
+why that call-site edit is a deferred follow-up.
+
 ## Exit codes
 
 `mv` follows the shared I4 process-exit convention:
@@ -161,7 +177,7 @@ declared in `src/mv.pdx`; the full per-code table is in `STATUS.md`.
 | `0xFFFFEB5x` | `Schema` | `MV_SCH_EMIT_FAIL`, `MV_SCH_SHORT_WRITE` |
 | `0xFFFFEB6x` | `Audit` | `MV_AUD_LOOKUP_FAIL`, `MV_AUD_SEND_FAIL` |
 | `0xFFFFEB7x` | `Undo` | `MV_UND_WRITE_FAIL` |
-| `0xFFFFEB8x` | `Elevate` | `MV_ELV_LOOKUP_FAIL`, `MV_ELV_SEND_FAIL`, `MV_ELV_DENIED` |
+| `0xFFFFEB8x` | `Elevate` / `ElevateGate` | `MV_ELV_LOOKUP_FAIL`, `MV_ELV_SEND_FAIL`, `MV_ELV_DENIED`, `MV_ELVG_STUB` (LE-001, #29) |
 
 ## Capabilities
 

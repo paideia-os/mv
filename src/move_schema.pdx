@@ -1,0 +1,110 @@
+// src/move_schema.pdx -- mv.R90-XREPO.012 (paideia-os/mv#33)
+//
+// MoveSchema module: publishes the MoveRecord@0.2 schema fingerprint
+// (compact DDL bytes + a compile-time schema-id constant) as a
+// standalone, dependency-free constants module.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// mv#31 (src/pipe.pdx, `Pipe::pipe_emit_move_record`) wires the real
+// sys_semantic_send (sysno 115, R107-M0-001 #2350) emission of one
+// MoveRecord@0.2 per completed move. That module owns the WIRE
+// encoding (byte offsets, register plan, the syscall itself). THIS
+// module owns the human/machine-readable SCHEMA DESCRIPTION a
+// downstream consumer (libpdx-schema-registry, R90-XREPO.012 parent
+// #2000; a `doc`/`cat` schema decoder; a shell pipeline formatter)
+// resolves the wire schema tag against, without having to read
+// pipe.pdx's asm to learn the field layout.
+//
+// `MOVE_RECORD_SCHEMA_ID` is the SAME numeric value `Pipe::
+// pipe_emit_move_record` writes into RDI before `syscall` (see
+// pipe.pdx's `MOVE_RECORD_SCHEMA` constant) -- one source of truth
+// for the id, duplicated as a plain constant here so a consumer-side
+// tool can depend on move_schema.pdx alone (no pipe.pdx asm, no
+// sys_semantic_send knowledge) to recognise mv's wire schema tag.
+// Should the two constants ever drift, that is a bug in this module,
+// not in pipe.pdx (pipe.pdx's copy is the operationally load-bearing
+// one; this module's copy is the published fingerprint).
+//
+// =============================================================================
+// DDL FORMAT
+// =============================================================================
+//
+// A single compact, single-line, NUL-terminated ASCII string --
+// `Name@version{field:type,field:type,...}` -- deliberately not a
+// binary TLV shape: this is a fingerprint a human reads in a hex
+// dump or a `doc mv` listing, not a decoder input (libpdx-schema-
+// registry's own DDL grammar, R90-XREPO.012.M4-001, is the eventual
+// machine-parsed target; this string is forward-compatible with that
+// grammar's field-list shape but is not itself registered there at
+// this landing).
+//
+// `reserved:u64[8]` documents the 8-word (64-byte) pad
+// `Pipe::pipe_emit_move_record` zero-fills at wire offset 56..119 --
+// headroom for a MoveRecord@0.3 without a schema-id-band rename
+// (bump the low 16 bits of MOVE_RECORD_SCHEMA_ID the same way cp's
+// CopyRecord schema tag reserves its low byte for a version marker).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`MoveSchema`; strips the
+//     underscore from the file basename `move_schema.pdx`, matching
+//     the `elevate_gate.pdx` -> `ElevateGate` and `pdxfs_txn.pdx` ->
+//     `PdxfsTxn` convention this same landing establishes).
+//   - No functions, no `unsafe` blocks, no branches -- pure constants
+//     module. No encoder pitfalls apply (no `test`, no `and`, no
+//     `imul`, no byte registers, no labels).
+//   - The DDL string is a SINGLE LINE (feedback_pdx_encoder_pitfalls:
+//     a multiline `pub let ... = "..."` has previously broken the
+//     fingerprint extractor / string-literal parser in this
+//     toolchain). Byte count is exact: 144 printable ASCII bytes +
+//     one trailing `\0` = 145, matching the `[u8; 145]` array type.
+//   - `MOVE_RECORD_SCHEMA_ID` exceeds 0x7FFFFFFF (imm32 range) but a
+//     top-level `pub let NAME : u64 = <imm64>` constant declaration
+//     is not subject to the inline `mov reg, imm` encoding-width
+//     restriction that applies to instruction operands -- precedent:
+//     `Schema::MV_MOVE_RECORD_MAGIC` in schema.pdx already declares
+//     a full 64-bit constant this way.
+
+module MoveSchema = structure {
+
+  // ==========================================================================
+  // MoveRecord@0.2 schema id.
+  //
+  // 0xE060_4D56_0002 (underscores here are documentation-only; the
+  // code below has none, matching the pattern the rest of this repo
+  // and libpdx-audit's AUDIT_HDR_WORD use). Packs:
+  //   high 32 bits 0xE0604D56 -- mv's schema-id band (0xE060xxxx,
+  //                              distinct from Schema module's
+  //                              0xFFFFEB5x diagnostic-code band)
+  //                              followed by ASCII 'MV' (0x4D56).
+  //   low  16 bits 0x0002     -- schema version (MoveRecord@0.2).
+  //                              A future MoveRecord@0.3 bumps only
+  //                              this half, same discipline as cp's
+  //                              CopyRecord@0.1 low-byte version
+  //                              marker.
+  //
+  // Must stay numerically identical to `Pipe::MOVE_RECORD_SCHEMA` in
+  // src/pipe.pdx -- see module header.
+  // ==========================================================================
+  pub let MOVE_RECORD_SCHEMA_ID : u64 = 0xE0604D560002
+
+  // ==========================================================================
+  // MoveRecord@0.2 compact DDL (144 bytes + NUL = 145).
+  //
+  // Field order matches the wire offsets Pipe::pipe_emit_move_record
+  // writes (src/pipe.pdx): version@0(u32) / op@4(u32) /
+  // src_hash_lo@8 / src_hash_hi@16 / dst_hash_lo@24 / dst_hash_hi@32
+  // / bytes_moved@40 / timestamp@48 / reserved@56..119 (8 x u64).
+  // Populated wire length is 120 bytes; the .bss record buffer
+  // reserves 128 bytes of headroom (see pipe.pdx), well under the
+  // sysno-115 240-byte per-slot ring cap.
+  // ==========================================================================
+  pub let MOVE_RECORD_DDL_LEN : u64 = 145
+
+  pub let move_record_ddl : [u8; 145] = "MoveRecord@0.2{version:u32,op:u32,src_hash_lo:u64,src_hash_hi:u64,dst_hash_lo:u64,dst_hash_hi:u64,bytes_moved:u64,timestamp:u64,reserved:u64[8]}\0"
+}

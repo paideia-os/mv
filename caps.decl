@@ -65,6 +65,28 @@
 # keeps old owner tail; verbose diagnostic flags the degrade).
 # KIND_ELEVATE_CHANNEL = 0x191 (R48.M7 substrate at paideia-os
 # src/kernel/core/ipc/elevate_broker.pdx). Live at HEAD 2026-08-22.
+#
+# --- R90-XREPO.010 substrate adoption note (mv#28) ----------------------
+# R90-XREPO.010 landed the REAL PdxFS v1 TXN syscalls this file's
+# KIND_PDXFS_TXN row already anticipated: sys_pdxfs_txn_open (sysno
+# 70), sys_pdxfs_txn_commit (104), sys_pdxfs_txn_abort (105),
+# sys_pdxfs_stat_by_inode (106), sys_pdxfs_undo_write (107) --
+# design/kernel/pdxfs-syscalls.md §3 in the paideia-os repo is the
+# authoritative source; src/pdxfs_txn.pdx (mv#34) wires mv onto them.
+# This DOES NOT change the requires: list below -- the R90 substrate
+# still gates txn_open behind a KIND_PDXFS_TXN mint exactly as M2-001
+# already declared (unlike cp's R90-XREPO.013.M3-003 landing, which
+# added a NEW KIND_PDXFS_VOL row for its own outer-TXN re-wire (cp#31)
+# -- cp's txn_open call passes a volume-scoping argument mv does not
+# yet need at same-device/same-user scope). Reconciliation verified
+# against cp/caps.decl's own R90-XREPO adoption note and cp/CHANGELOG.
+# md's sysno cross-references as the sibling-tool precedent.
+#
+# sys_semantic_send caveat (v1.3.0, mv#31) -- mirrors cp's own note:
+# the sysno-115 producer path (Pipe::pipe_emit_move_record, src/
+# pipe.pdx) takes no cap slot at the R107-M0-001 landing. If a future
+# R107 wave adds a per-schema KIND_SEMANTIC_PIPE gate for the send
+# side, this file grows a new row at that time.
 requires:
   - KIND_USER (self)
   - KIND_IPC_ENDPOINT (invoke)
@@ -74,8 +96,8 @@ requires:
   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)
 
 # Declared output schemas — the semantic-pipe schema records mv emits
-# on stdout. M1 emits none (a successful same-dir rename is silent
-# unless -v is given, in which case a plain-text `mv <src> <dst>`
-# line goes to stdout via the tty). M3 introduces MoveRecord[] via
-# libpdx-semantic-pipe with was_rename / was_cross_device flags.
-declares_output_schemas: (none)
+# on the sys_semantic_send ring (v1.3.0, mv#31/mv#33 -- see src/
+# pipe.pdx and src/move_schema.pdx). Superseded/additive to the older
+# M3-001 fd-1 stub blob (Schema module, unchanged by this release).
+declares_output_schemas:
+  - MoveRecord@0.2 (schema=0xE0604D560002, len=120, via=sys_semantic_send)

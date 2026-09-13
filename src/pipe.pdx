@@ -1,0 +1,306 @@
+// src/pipe.pdx -- mv v1.1-B (paideia-os/mv#31)
+// Pipe module: MoveRecord@0.2 emission via sys_semantic_send (sysno 115).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Same shape as cp's own sys_semantic_send landing (paideia-os/cp#33,
+// src/pipe.pdx `Pipe::pipe_emit_copy_record`, cp v1.2.0): R107-M0-001
+// (paideia-os #2350) landed the kernel-side sys_semantic_send producer
+// substrate at sysno 115 with a 240-byte record cap and a 16-slot
+// single-global ring. This module wires mv onto the SAME substrate so
+// every completed move emits one MoveRecord@0.2 for downstream
+// consumers (shell pipelines, session recorders, semantic-pipe
+// subscribers) -- distinct from (and additive to) the pre-existing
+// M3-001 `Schema::mv_schema_emit` fd-1 stub blob, which the M3-002
+// audit hook and M3-003 undo hook still consume unchanged (see
+// schema.pdx's own header). This landing does not touch Schema.
+//
+// The record's field SHAPE is described independently in
+// `src/move_schema.pdx` (`MoveSchema::move_record_ddl` +
+// `MOVE_RECORD_SCHEMA_ID`, paideia-os/mv#33) -- this file owns the
+// wire encoding only.
+//
+// Contract (sys_semantic_send, verbatim from src/kernel/core/syscall/
+// handlers/sys_semantic_send.pdx, mirrored from cp/src/pipe.pdx):
+//   rdi = schema      opaque u64 schema tag (echoed to the consumer;
+//                     kernel does not interpret)
+//   rsi = record_ptr  user VA of the record bytes
+//   rdx = record_len  bytes in [1, 240]
+//   rax = 0 on success, or negative-errno u64 on failure
+//         (-EFAULT for bad record_ptr, -EINVAL for out-of-range len).
+//
+// Return-value handling: discarded at the (future) call site, same
+// posture as cp's cp_eof -- a non-zero return here is a marshalling
+// bug in THIS file, not a per-run condition a caller acts on.
+//
+// =============================================================================
+// CALL-SITE WIRING STATUS (honest, per this org's own precedent)
+// =============================================================================
+//
+// `pipe_emit_move_record` is fully implemented and ready to call, but
+// this landing does NOT insert the call into `Move::move_dispatch`'s
+// success tail. move.pdx is a ~1300-line dispatcher already flagged
+// for a post-loop God-file refactor (feedback_god_file_refactor); an
+// unverified insertion into its register-heavy success path (no build
+// available at this landing -- IMPL-ONLY) is not a responsible edit.
+// This mirrors cp's OWN precedent exactly: cp#31 landed caps.decl +
+// KIND_PDXFS_VOL as "DECLARATION + ADOPTION NOTE only", explicitly
+// deferring the call-site body-edit to cp#35. The mv equivalent of
+// cp#35 (threading `call pipe_emit_move_record` into move_dispatch's
+// success return, immediately before the final `ret`) is the next
+// mechanical follow-up; the ABI (three args: src_ptr, dst_ptr,
+// bytes_moved -- the last already lives in `Move::mv_move_xdev_bytes`
+// for the cross-device path, 0 for the same-device rename fast path)
+// is frozen by this landing.
+//
+// =============================================================================
+// RECORD LAYOUT (MoveRecord@0.2, 120 bytes populated; @align(8))
+// =============================================================================
+//
+//   [ +0] version      u32   -- schema minor version = 2
+//   [ +4] op           u32   -- MV_OP_MOVE = 1
+//   [ +8] src_hash_lo  u64   -- FNV-1a64(src_path, FNV_OFFSET_BASIS)
+//   [+16] src_hash_hi  u64   -- FNV-1a64(src_path, FNV_ALT_SEED) --
+//                                same bytes, a second independent
+//                                seed; NOT a true 128-bit hash (no
+//                                blake3 host in this toolchain at
+//                                this landing), but a stable two-word
+//                                fingerprint good enough for
+//                                consumer-side dedup/grouping.
+//   [+24] dst_hash_lo  u64   -- FNV-1a64(dst_path, FNV_OFFSET_BASIS)
+//   [+32] dst_hash_hi  u64   -- FNV-1a64(dst_path, FNV_ALT_SEED)
+//   [+40] bytes_moved  u64   -- 0 for a same-device rename (metadata-
+//                                only); Move::mv_move_xdev_bytes for
+//                                the cross-device byte-copy fallback.
+//   [+48] timestamp    u64   -- rdtsc snapshot at emit time (raw TSC
+//                                ticks, same posture as cp's
+//                                tsc_ticks field, until sys_clock_now
+//                                lands).
+//   [+56..119] reserved u64[8] -- zero-filled, 64 bytes of headroom
+//                                for a MoveRecord@0.3 without a
+//                                schema-id-band rename.
+//
+// version+op are packed into ONE u64 store at offset 0
+// (little-endian: version occupies bytes 0-3, op occupies bytes 4-7)
+// -- `mov [buf+0], rax` where rax = (op << 32) | version, matching
+// the single-store-per-word discipline the rest of this codebase uses
+// (paideia-as has no `mov [mem], imm64` in one instruction; every
+// memory write here stores FROM a register).
+//
+// The .bss scratch buffer reserves 128 bytes (`pipe_record_buf`) --
+// 8 bytes above the 120-byte populated extent, matching this issue's
+// "128B MoveRecord" framing as an aligned allocation cap rather than
+// the exact struct size (same posture as cp's 240-byte ring-slot cap
+// vs. its own 24-byte CopyRecord@0.1).
+//
+// =============================================================================
+// SCHEMA TAG
+// =============================================================================
+//
+// MOVE_RECORD_SCHEMA below is numerically identical to
+// `MoveSchema::MOVE_RECORD_SCHEMA_ID` (src/move_schema.pdx,
+// paideia-os/mv#33) -- 0xE0604D560002. Duplicated here (rather than
+// referenced) because this file's `mov rdi, imm64` operand must be a
+// literal for the movabs encoding; see move_schema.pdx's header for
+// why the two copies must stay numerically identical.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (mirrors cp/src/pipe.pdx verbatim)
+// =============================================================================
+//
+//   - Module Pipe (PascalCase basename matches src/pipe.pdx).
+//   - No `test` mnemonic; every zero-check in the hash loop uses
+//     `cmp reg, 0`.
+//   - `imul rax, r10` is the 2-register form (dst, src), never the
+//     2-operand immediate form the encoder pitfall list bans.
+//   - No `and rN, imm64` on r8-r15 anywhere in this file.
+//   - Byte loads use the `xor r9, r9; mov_b r9, [rdi + rcx]` idiom
+//     (paideia-as #1248 mitigation; same idiom as rn_strlen in
+//     rename.pdx, targeting r9 instead of rax/rcx since rax holds the
+//     hash accumulator and rcx the loop index here -- `mov_b` is not
+//     restricted to any one destination register, per cat/src/
+//     entry.pdx's `mov_b rcx, [rdi]` and tty_sink.pdx's `mov_b [r10],
+//     rdi` precedents).
+//   - FNV_PRIME (0x100000001b3) and the two seed constants exceed
+//     0x7FFFFFFF and use `mov r64, imm64` (paideia-as auto-selects
+//     the REX+imm64 / movabs encoding), matching cp's own schema-tag
+//     precedent.
+//   - Reserved-label discipline: loop labels in this file are
+//     prefixed `pipe_fnv_`, dodging the `loop` keyword clash.
+//   - `pipe_fnv1a64` is a LEAF (loop, no CALLs). `pipe_emit_move_
+//     record` makes four nested calls to it plus one `rdtsc`; three
+//     callee-save pushes (rbx=src_ptr, r12=dst_ptr, r13=bytes_moved)
+//     is an ODD count, so entry rsp%16==8 lands at rsp%16==0 after
+//     the third push -- ready for every nested CALL without a
+//     separate alignment pad (same odd-push idiom as rename.pdx's
+//     rn_xdev_copy_unlink and move.pdx's move_cross_dev_body, just
+//     with three pushes instead of five).
+
+module Pipe = structure {
+
+  // -- Syscall id -------------------------------------------------------
+  // R107-M0-001 (paideia-os #2350). Mirrors dispatch.pdx L824 and cp's
+  // own Pipe::SYSCALL_SEMANTIC_SEND.
+  pub let SYSCALL_SEMANTIC_SEND : u64 = 115
+
+  // -- Record shape constants --------------------------------------------
+  pub let MOVE_RECORD_LEN : u64 = 120   // populated bytes sent on the wire
+  pub let MOVE_RECORD_BUF_CAP : u64 = 128 // .bss allocation (headroom)
+
+  pub let MV_OP_MOVE : u64 = 1
+
+  // -- Schema tag ---------------------------------------------------------
+  // See module header -- must stay numerically identical to
+  // MoveSchema::MOVE_RECORD_SCHEMA_ID (src/move_schema.pdx).
+  pub let MOVE_RECORD_SCHEMA : u64 = 0xE0604D560002
+
+  // -- FNV-1a64 constants ---------------------------------------------
+  pub let FNV_PRIME : u64 = 0x100000001b3
+  pub let FNV_OFFSET_BASIS : u64 = 0xcbf29ce484222325
+  pub let FNV_ALT_SEED : u64 = 0x9E3779B97F4A7C15  // golden-ratio mix constant
+
+  // -- Record scratch buffer (.bss, single global) ------------------------
+  pub let mut pipe_record_buf : [u8; 128] = uninit @align(8)
+
+  // ==========================================================================
+  // pipe_fnv1a64(ptr, seed) -> hash
+  //
+  // Standard FNV-1a 64-bit hash over a NUL-terminated byte string,
+  // seeded with `seed` instead of the canonical offset-basis constant
+  // so the SAME string can be hashed twice under two different seeds
+  // to produce a cheap two-word (lo/hi) fingerprint -- see module
+  // header for why this is not a true 128-bit hash.
+  //
+  // RDI (input): ptr  -- NUL-terminated string (caller-owned; not
+  //                       mutated, not bounds-checked beyond the NUL).
+  // RSI (input): seed -- initial hash value (FNV_OFFSET_BASIS or
+  //                       FNV_ALT_SEED at the two call sites below).
+  // RAX (output): the 64-bit hash.
+  //
+  // Leaf function: no CALLs, no push/pop parity to preserve. Clobbers
+  // rax (accumulator + return), rcx (loop index), r9 (byte temp), r10
+  // (FNV_PRIME, loaded once before the loop). rdi is preserved
+  // throughout (only indexed off, never overwritten).
+  // ==========================================================================
+  pub let pipe_fnv1a64 : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (seed: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv v1.1-B (#31): pipe_fnv1a64 -- seeded FNV-1a 64-bit hash over a NUL-terminated path string, used twice per path (two different seeds) by pipe_emit_move_record to build a cheap lo/hi path fingerprint pair. Byte-load idiom (`xor r9, r9; mov_b r9, [rdi + rcx]`) matches rn_strlen's `xor rax,rax; mov_b rax,[rdi+rcx]` pattern in rename.pdx, just retargeted to r9 since rax already holds the hash accumulator here (mov_b is not restricted to one destination register -- cat/src/entry.pdx's `mov_b rcx, [rdi]` and tty_sink.pdx's `mov_b [r10], rdi` are precedent for arbitrary-register mov_b). Loop: on NUL (r9 == 0) return the accumulated hash in rax; otherwise XOR the byte into the hash then multiply by FNV_PRIME via the 2-register `imul rax, r10` form (never the banned 2-operand-immediate imul), advance rcx, repeat. FNV_PRIME (0x100000001b3) exceeds imm32 and is loaded via `mov r10, imm64` (paideia-as auto-selects movabs). Leaf: no callee-save touched, no CALLs. Labels prefixed pipe_fnv_ to dodge the loop keyword. Every `cmp reg, imm` uses imm 0 (fits imm32).",
+      block: {
+        mov rax, rsi;                        // hash = seed
+        xor rcx, rcx;                        // i = 0
+        mov r10, 0x100000001b3;              // FNV_PRIME (movabs)
+      pipe_fnv_loop:
+        xor r9, r9;
+        mov_b r9, [rdi + rcx];               // byte = ptr[i]
+        cmp r9, 0;
+        je  pipe_fnv_done;
+        xor rax, r9;                         // hash ^= byte
+        imul rax, r10;                       // hash *= FNV_PRIME
+        add rcx, 1;
+        jmp pipe_fnv_loop;
+      pipe_fnv_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipe_emit_move_record(src_ptr, dst_ptr, bytes_moved) -> discarded
+  //
+  // RDI (input): src_ptr     -- NUL-terminated source path.
+  // RSI (input): dst_ptr     -- NUL-terminated destination path.
+  // RDX (input): bytes_moved -- 0 for a same-device rename; the
+  //                              cross-device byte-copy accumulator
+  //                              otherwise (Move::mv_move_xdev_bytes).
+  // RAX (output): the sys_semantic_send return verbatim (caller
+  //               discards -- see module header).
+  //
+  // Marshal the 120-byte MoveRecord@0.2 into pipe_record_buf, then
+  // invoke sys_semantic_send. See module header for the full field
+  // layout and register plan.
+  // ==========================================================================
+  pub let pipe_emit_move_record : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) (bytes_moved: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mv v1.1-B (#31): pipe_emit_move_record -- marshals + emits one MoveRecord@0.2 via sys_semantic_send (sysno 115). Three callee-save pushes (rbx=src_ptr, r12=dst_ptr, r13=bytes_moved; ODD count) land rsp%16==0 from entry rsp%16==8, ready for the four nested pipe_fnv1a64 calls (src lo/hi, dst lo/hi) without a separate alignment pad -- same odd-push idiom as rename.pdx's rn_xdev_copy_unlink. Sequence: (1) hash src_ptr under FNV_OFFSET_BASIS -> [buf+8] (src_hash_lo), then under FNV_ALT_SEED -> [buf+16] (src_hash_hi); (2) same pair for dst_ptr -> [buf+24]/[buf+32]; (3) store bytes_moved (r13, untouched since entry) -> [buf+40]; (4) rdtsc -> full 64-bit tick count via the standard `shl rdx,32; or rax,rdx` reconstruction (proven at src/kernel/core/fs/pdxfs_lite/uuid.pdx, reused verbatim by cp's pipe_emit_copy_record) -> [buf+48] (timestamp); (5) pack op=MV_OP_MOVE(1) into the high 32 bits and version=2 into the low 32 bits of one u64 (`mov rax,1; shl rax,32; add rax,2`) -> [buf+0] (little-endian: version at bytes 0-3, op at bytes 4-7); (6) eight explicit zero-stores fill the 64-byte reserved band at [buf+56..112] in 8-byte strides (no loop -- matches the direct-store discipline schema.pdx's populate function uses for a small fixed field count); (7) sys_semantic_send(schema=MOVE_RECORD_SCHEMA via movabs, buf, len=120, sysno=115). Every `lea r11, [rip + pipe_record_buf]` reload follows the r11-scratch-per-.bss-reach discipline this repo uses throughout (schema.pdx, rename.pdx) rather than caching the base pointer across the intervening CALLs (r11 is caller-save and the pipe_fnv1a64 calls do not promise to preserve it). No test mnemonic; only zero-checks are inside pipe_fnv1a64, not here. No `and rN, imm64` on r8-r15. Only imul use is inside pipe_fnv1a64 (2-register form). Encoder discipline: MOVE_RECORD_SCHEMA (0xE0604D560002) exceeds imm32 and uses `mov rdi, imm64` (movabs). Effects !{mem, sysreg} for the four nested-call clobbers plus the syscall's own rcx/r11 clobber; no capabilities (sys_semantic_send's producer path takes no cap slot at the R107-M0-001 landing, mirrored from cp's own caps.decl note). Return value verbatim; caller discards (see module header on deferred call-site wiring).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // src_ptr
+        mov r12, rsi;                        // dst_ptr
+        mov r13, rdx;                        // bytes_moved
+
+        // ---- src_hash_lo / src_hash_hi -----------------------------
+        mov rdi, rbx;
+        mov rsi, 0xcbf29ce484222325;          // FNV_OFFSET_BASIS
+        call pipe_fnv1a64;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 8], rax;                  // src_hash_lo
+
+        mov rdi, rbx;
+        mov rsi, 0x9E3779B97F4A7C15;          // FNV_ALT_SEED
+        call pipe_fnv1a64;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 16], rax;                 // src_hash_hi
+
+        // ---- dst_hash_lo / dst_hash_hi -----------------------------
+        mov rdi, r12;
+        mov rsi, 0xcbf29ce484222325;          // FNV_OFFSET_BASIS
+        call pipe_fnv1a64;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 24], rax;                 // dst_hash_lo
+
+        mov rdi, r12;
+        mov rsi, 0x9E3779B97F4A7C15;          // FNV_ALT_SEED
+        call pipe_fnv1a64;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 32], rax;                 // dst_hash_hi
+
+        // ---- bytes_moved --------------------------------------------
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 40], r13;                 // bytes_moved
+
+        // ---- timestamp (rdtsc) ----------------------------------------
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 48], rax;                 // timestamp
+
+        // ---- version (low32) | op (high32), packed into one u64 ----
+        mov rax, 1;                          // MV_OP_MOVE
+        shl rax, 32;
+        add rax, 2;                          // schema minor version 2
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 0], rax;                  // version @+0, op @+4
+
+        // ---- reserved[8] zero-fill (offsets 56..112, 8 x u64) -------
+        xor rax, rax;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 56], rax;
+        mov [r11 + 64], rax;
+        mov [r11 + 72], rax;
+        mov [r11 + 80], rax;
+        mov [r11 + 88], rax;
+        mov [r11 + 96], rax;
+        mov [r11 + 104], rax;
+        mov [r11 + 112], rax;
+
+        // ---- sys_semantic_send(schema, buf, 120). sysno 115. --------
+        mov rdi, 0xE0604D560002;              // MOVE_RECORD_SCHEMA (movabs)
+        lea rsi, [rip + pipe_record_buf];
+        mov rdx, 120;                         // MOVE_RECORD_LEN
+        mov rax, 115;                         // SYSCALL_SEMANTIC_SEND
+        syscall;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
