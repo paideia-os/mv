@@ -22,16 +22,16 @@
 
 [package]
 name          = mv
-version       = 1.1.0
+version       = 1.2.0
 wave          = R50
 milestone     = M5
 category      = A/coreutils
 priority      = P0
 license       = MIT
 repository    = https://github.com/paideia-os/mv
-tag           = v1.1.0
+tag           = v1.2.0
 authored_by   = paideia-os-team
-released      = 2026-09-12
+released      = 2026-09-13
 
 [caps]
 # caps.decl fingerprint (BLAKE3-256 over the caps.decl file bytes at
@@ -78,6 +78,7 @@ src/undo.pdx     = pending:src-undo-blake3-256
 src/elevate.pdx  = pending:src-elevate-blake3-256
 src/verbose.pdx  = pending:src-verbose-blake3-256
 src/pdxfs.pdx    = pending:src-pdxfs-blake3-256
+src/entry.pdx    = pending:src-entry-blake3-256
 
 [schemas]
 # Semantic-pipe schemas mv emits (D2). Bound at M3-001 in src/schema.pdx.

@@ -7,6 +7,82 @@ and the issues each entry closes.
 
 ---
 
+## 1.2.0 — 2026-09-13 (Wave-C consolidation)
+
+Real-body entry point, POSIX multi-source form, cwd-relative operand
+resolve, and `-i` interactive confirm.  Retires the last M1-001 STUB
+reachable from `_start`: the process entry now dispatches through
+real syscalls end-to-end.
+
+- `mv.v1.2.0-A` (mv#30 flagship real-body extraction).  New
+  `src/entry.pdx` (`Entry` module) provides the process `_start`
+  entry frame.  Reads argc/argv from the frozen execve ABI
+  (rdi=argc, rsi=argv per `paideia-os design/user/execve-abi.md`),
+  parses the mv flag surface inline (short + long forms of `-i`,
+  `-v`, `-f`, `--dry-run`, `--verbose`, `--force`, `--interactive`),
+  and dispatches through `Rename::rename_same_dir` for every source.
+  Every helper on the hot path calls a real kernel syscall
+  (`sys_getcwd` SC+ ID 86, `sys_stat` SC+ ID 77, `sys_read` SC+
+  ID 0, `sys_write` SC+ ID 1, `sys_rename` SC+ ID 82, `sys_unlink`
+  SC+ ID 81, `sys_exit` SC+ ID 60); the M1-001 stubbed
+  Pdxfs::pdxfs_txn_* substrate is unreachable from `_start` at
+  v1.2.0.
+- `mv.ENH-002` (mv#18): `_start` entry frame + I4 exit-code
+  mapping.  0 = all requested moves succeeded (or user-declined via
+  `-i`); 1 = missing operand / usage; 2 = one-or-more-moves failed
+  (i/o, target not a directory, resolved-path overflow, unwritten
+  source).  Every terminal path in `_start` ends in `sys_exit`;
+  `@no_frame` reflects the never-return shape.
+- `mv.ENH-003` (mv#19): userspace cwd-relative operand resolution.
+  Both source and destination arguments are resolved against the
+  task cwd via `sys_getcwd` (SC+ ID 86, R86.M1-003 #1956 kernel
+  body at `src/kernel/core/syscall/sys_getcwd.pdx`) BEFORE the
+  `sys_rename` call site.  Matches the mkdir v1.1-B (#25) and
+  cp v1.1-B (#21) precedents: absolute paths pass through
+  unchanged; a cwd of exactly `/` skips the separator to avoid
+  `//foo`; overflow (>= 511 bytes) folds to -ENAMETOOLONG.  Two
+  new 512-byte scratches (`entry_src_resolved`,
+  `entry_dst_resolved`) plus one 256-byte cwd scratch
+  (`entry_cwd_scratch`).
+- `mv.ENH-005` (mv#21): `-i` interactive confirm via KIND_TTY.
+  `Entry::entry_confirm(dst)` emits `mv: overwrite '<dst>'? ` to
+  fd 2 (stderr) then reads a single byte from fd 0 via
+  `sys_read` (KIND_TTY read).  Only 'y' (0x79) or 'Y' (0x59)
+  proceeds; every other byte (including EOF, error, whitespace)
+  causes `entry_move_one` to skip that source cleanly (skip is
+  not counted as an error -- had_error stays 0).  The `-i` /
+  `--interactive` long form is recognised by the inline flag
+  scan in `_start`.
+- `mv.ENH-011` (mv#27): multi-source form `mv f1 f2 ... dir/`.
+  `_start` now accepts `pos_count >= 2` (previously
+  `MvArgv::mv_argv_parse` pinned it at exactly 2).  When
+  `pos_count > 2` the destination MUST resolve to a directory
+  (via `Entry::entry_probe_dir` -- sys_stat + S_IFDIR mask check,
+  with a trailing-'/' short-circuit for callers that spell
+  directory intent explicitly); a non-directory destination emits
+  `mv: target is not a directory (need dir/)` on stderr and exits
+  2.  Per source, `Entry::entry_move_multi` composes
+  `<dst_dir>/<basename(src)>` into a new 512-byte scratch
+  (`entry_dst_composed`) via `Entry::entry_compose_dir_slash_base`
+  (basename walker + slash-idempotent join, same shape as cp
+  `copy_join_dir_basename`) and then delegates to
+  `Entry::entry_move_one`.  A per-source failure sets `rbx = 1`
+  and continues the loop; a subsequent success does not clear
+  the flag (POSIX "any failure -> exit 2" convention).
+- `PDX_TOOL_NAME` extern (`"mv\0"`) added per the Wave-6
+  libpdx-argv v1.1.3 contract.  Stable NUL-terminated .rodata
+  byte array consumed by libpdx-argv's `diag_render` and by any
+  future `mv --help` renderer wanting to spell the tool's own
+  name without hard-coding it at the call site.  Length is *not*
+  exported -- consumers strlen the array.
+- Manifest bumped to 1.2.0.  `src/entry.pdx` added to the
+  `[artifacts]` stanza; `MoveRecord` schema stanza + `[undo]`
+  magic unchanged (Move::move_dispatch remains the substrate for
+  the pending R42 TXN-mediated path, which v1.2.0 does not
+  exercise from `_start`).
+
+---
+
 ## Unreleased (Enhancement v1.x)
 
 - `mv.ENH-004` (#20): destination-clobber guard. `Move::move_dispatch`

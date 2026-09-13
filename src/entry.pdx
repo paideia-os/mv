@@ -1,0 +1,1165 @@
+// src/entry.pdx -- mv v1.2.0-A (paideia-os/mv#30, #18, #19, #21, #27)
+//
+// Entry module: real-body process entry point + I4 exit-code mapping,
+// userspace cwd-relative operand resolve, multi-source `mv src1 src2
+// ... dst/` form, and `-i` interactive confirm via KIND_TTY.
+//
+// =============================================================================
+// SCOPE (v1.2.0-A)
+// =============================================================================
+//
+// v1.1-A landed the real Rename::rename_same_dir body (retiring the
+// M1-003 STUB) but shipped no `_start` -- consumers still had to
+// hand-call into rename_same_dir from a stubbed harness.  v1.2.0
+// closes the remaining Wave-C surface for mv#30 by providing a
+// concrete process entry frame that:
+//
+//   * reads argc / argv from the frozen execve ABI
+//     (paideia-os design/user/execve-abi.md: rdi=argc, rsi=argv);
+//   * parses the mv flag surface inline (no libpdx-argv call --
+//     mv_argv_parse pins pos_count == 2 which forecloses the
+//     multi-source form #27 mandates);
+//   * resolves any relative source or destination against the task
+//     cwd via sys_getcwd (SC+ ID 86, R86.M1-003 #1956) BEFORE
+//     calling sys_rename (matches mkdir v1.1-B #25 + cp v1.1-B #21);
+//   * accepts the POSIX multi-source shape `mv f1 f2 ... dir/`
+//     when the last positional is a directory (sys_stat + S_IFDIR
+//     mask check) or ends with a trailing '/';
+//   * on `-i` and a pre-existing destination, prompts via fd 2 and
+//     reads a single byte via fd 0 (KIND_TTY sys_read path); only
+//     'y' / 'Y' proceeds, every other byte skips this source; and
+//   * maps every internal MV_* return-code band value onto a small
+//     POSIX-shaped exit code the shell can consume:
+//         0 = every requested move succeeded
+//         1 = usage / missing operand
+//         2 = one or more moves failed (i/o, target not a directory,
+//             resolved-path overflow, unwritten source)
+//
+// =============================================================================
+// PDX_TOOL_NAME
+// =============================================================================
+//
+// libpdx-argv v1.1.3 (paideia-os/libpdx-argv#*) established a stable
+// contract: every mv-shaped tool exports `PDX_TOOL_NAME` as a NUL-
+// terminated .rodata byte array so diag_render can prefix stderr
+// lines uniformly.  This module owns that symbol for mv.  The
+// prefix is `mv:` in every message we compose ourselves; libpdx-argv
+// consumers read PDX_TOOL_NAME for `mv --help` / diagnostic paths
+// that _start does not itself walk.
+//
+// =============================================================================
+// WHY A DEDICATED _start MODULE (v1.2.0 vs the v1.1 shape)
+// =============================================================================
+//
+// v1.1-A had no _start; the harness pointed sys_execve at Rename::
+// rename_same_dir directly via an ad-hoc trampoline.  That forced
+// argc/argv marshalling into the harness AND foreclosed multi-source
+// (#27), interactive-confirm (#21), and per-source cwd resolve
+// (#19). Putting the entry point in its own module keeps the
+// existing Mv / MvArgv / Rename / Move / Pdxfs modules intact
+// (their .bss and their MV_* code bands stay authoritative), while
+// providing the single `_start` symbol the loader binds and letting
+// v1.3+ retire MvArgv and Move::move_dispatch (both still gated on
+// R42 substrate) without another entry-point shuffle.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (v0.36+)
+// =============================================================================
+//
+//   - Module Entry (PascalCase basename matches src/entry.pdx).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate <= 0x7FFFFFFF; larger
+//     literals (SIB scale 1 offsets, POSIX mode masks) are staged
+//     through r11 via movabs or `lea` before compare.
+//   - No `and rN, imm` on r8-r15 (avoided; ANDs use reg-reg through
+//     r11).  No 2-op `imul r, imm`.  No `cmp reg, [mem]` (loads go
+//     to a scratch first).  Byte loads use the `xor rax, rax;
+//     mov_b rax, [ptr]` pattern per paideia-as #1248 mitigation.
+//   - Reserved-label prefix `en_` (not `loop` / `done` / `head` /
+//     `if` / `let` bare) to dodge paideia-as reserved keywords.
+//   - Every function that calls a nested SysV function respects
+//     the 16-byte alignment rule at the call site.  Helpers use
+//     odd-count push idioms or `sub rsp, 8` pads (matching cp /
+//     cat / mkdir precedent).
+//   - _start marked @no_frame -- every terminal path is sys_exit
+//     which never returns, so no callee-save discipline applies;
+//     the initial `sub rsp, 8` aligns rsp%16 to 0 for the nested
+//     helper CALL sites (execve delivers rsp%16 == 8 per rm /
+//     cat _start precedent), never restored.
+
+module Entry = structure {
+
+  // ==========================================================================
+  // PDX_TOOL_NAME (libpdx-argv v1.1.3 contract)
+  //
+  // Static NUL-terminated tool identifier consumed by libpdx-argv's
+  // diag_render and by any future `mv --help` renderer wanting to
+  // spell the tool's own name without hard-coding it at the call
+  // site.  Length is *not* exported -- consumers strlen the array.
+  // ==========================================================================
+  pub let PDX_TOOL_NAME : [u8; 3] = "mv\0"
+
+  // ==========================================================================
+  // Version blob for a future --version fast path.  Prefix-compare
+  // stable across bump; the `-A` marker calls out the v1.2 substrate
+  // landing (real entry point + multi-source + cwd resolve + -i).
+  // ==========================================================================
+  pub let entry_version_msg : [u8; 25] = "mv (paideia-os) 1.2.0-A\n\0"
+  pub let entry_version_msg_len : u64 = 24
+
+  // ==========================================================================
+  // Diagnostic message blobs.  Every message carries its own leading
+  // `mv: ` prefix and trailing `\n` so the fd-2 write is a single
+  // syscall (matches the cp / cat convention).  All literals single-
+  // line per tools/verify-fingerprint-coverage.sh's extractor.
+  // ==========================================================================
+  pub let entry_msg_missing : [u8; 40] = "mv: missing file operand (need SRC DST)\0"
+  pub let entry_msg_missing_len : u64 = 39
+
+  pub let entry_msg_missing_nl : [u8; 2] = "\n\0"
+  pub let entry_msg_missing_nl_len : u64 = 1
+
+  pub let entry_msg_getcwd_fail : [u8; 22] = "mv: getcwd failed\n\0\0\0\0"
+  pub let entry_msg_getcwd_fail_len : u64 = 18
+
+  pub let entry_msg_too_long : [u8; 29] = "mv: resolved path too long\n\0\0"
+  pub let entry_msg_too_long_len : u64 = 27
+
+  pub let entry_msg_notdir : [u8; 42] = "mv: target is not a directory (need dir/)\0"
+  pub let entry_msg_notdir_len : u64 = 41
+
+  pub let entry_msg_notdir_nl : [u8; 2] = "\n\0"
+  pub let entry_msg_notdir_nl_len : u64 = 1
+
+  pub let entry_msg_rename_fail : [u8; 22] = "mv: rename failed\n\0\0\0\0"
+  pub let entry_msg_rename_fail_len : u64 = 18
+
+  pub let entry_msg_prompt_a : [u8; 16] = "mv: overwrite '\0"
+  pub let entry_msg_prompt_a_len : u64 = 15
+
+  pub let entry_msg_prompt_b : [u8; 4] = "'? \0"
+  pub let entry_msg_prompt_b_len : u64 = 3
+
+  // ==========================================================================
+  // Scratch storage.  Two 256-byte cwd/user-length staging blobs plus
+  // two 512-byte resolved-path scratches (cwd + '/' + user can grow
+  // beyond 256 when the user path itself already carries directory
+  // components).  512 is well below the kernel's own PATH_MAX and
+  // matches the cp copy_dst_path shape.
+  // ==========================================================================
+  pub let ENTRY_CWD_SCRATCH_LEN     : u64 = 256
+  pub let ENTRY_RESOLVED_LEN        : u64 = 512
+  pub let ENTRY_STAT_LEN            : u64 = 64
+
+  pub let mut entry_cwd_scratch     : [u8; 256] = uninit @align(8)
+  pub let mut entry_src_resolved    : [u8; 512] = uninit @align(8)
+  pub let mut entry_dst_resolved    : [u8; 512] = uninit @align(8)
+  pub let mut entry_dst_composed    : [u8; 512] = uninit @align(8)
+  pub let mut entry_stat_buf        : [u8; 64]  = uninit @align(8)
+  pub let mut entry_prompt_byte     : [u8; 8]   = uninit @align(8)
+
+  // Flag storage (entry-local so mv_argv_parse is not on the hot path).
+  pub let mut entry_flag_i          : u64 = uninit @align(8)
+  pub let mut entry_flag_v          : u64 = uninit @align(8)
+  pub let mut entry_flag_f          : u64 = uninit @align(8)
+  pub let mut entry_flag_dry        : u64 = uninit @align(8)
+
+  // Multi-source dispatch state, populated by _start.
+  pub let mut entry_dst_ptr         : u64 = uninit @align(8)  // caller's dst arg
+  pub let mut entry_dst_is_dir      : u64 = uninit @align(8)  // 1 iff dst resolves to a dir
+  pub let mut entry_had_error       : u64 = uninit @align(8)  // 0=all ok, 1=any failure
+
+  // POSIX mode masks (mirror src/kernel/core/fs/vfs_open.pdx / sys_stat.pdx).
+  pub let ENTRY_S_IFMT              : u64 = 0xF000
+  pub let ENTRY_S_IFDIR             : u64 = 0x4000
+  pub let ENTRY_STAT_MODE_OFS       : u64 = 24
+  pub let ENTRY_SYS_STAT            : u64 = 77
+  pub let ENTRY_SYS_GETCWD          : u64 = 86
+  pub let ENTRY_SYS_READ            : u64 = 0
+  pub let ENTRY_SYS_WRITE           : u64 = 1
+  pub let ENTRY_SYS_EXIT            : u64 = 60
+
+  // ==========================================================================
+  // entry_strlen(ptr) -> len
+  //
+  // NUL-terminated string length.  Leaf; walks bytes via the `xor rax,
+  // rax; mov_b rax, [ptr]` #1248 mitigation.  Same shape as cat's
+  // entry_strlen_nul and mv's Rename::rn_strlen.
+  // ==========================================================================
+  pub let entry_strlen : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.v1.2.0-A entry_strlen. Byte-loop NUL scan; return count in rax.  Same idiom as Rename::rn_strlen (src/rename.pdx) and cat.Entry::entry_strlen_nul.  Leaf: no push/pop parity to preserve.  rdi preserved by convention (we only index off it).  Labels prefixed en_sl_ per the paideia-as reserved-label discipline (`loop` is a keyword).",
+      block: {
+        xor rax, rax;
+      en_sl_head:
+        xor rcx, rcx;
+        mov_b rcx, [rdi + rax*1];
+        cmp rcx, 0;
+        je  en_sl_done;
+        add rax, 1;
+        jmp en_sl_head;
+      en_sl_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_basename_ofs(ptr) -> ofs
+  //
+  // Return the offset within ptr[] of the byte after the last '/'
+  // (i.e. the basename start).  0 if ptr contains no slash.  Used by
+  // the multi-source form to compose `<dst>/<basename(src)>`.
+  // ==========================================================================
+  pub let entry_basename_ofs : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.v1.2.0-A entry_basename_ofs. Walk NUL-terminated path; record index of last '/' + 1 as basename_start (0 default -- no slash).  Same idiom as cp CopyFile::copy_join_dir_basename Phase 2.  Leaf; labels prefixed en_bn_.  Every byte load via xor+mov_b (#1248).  cmp against 4095 caps runaway walks.",
+      block: {
+        xor rax, rax;                          // basename_ofs = 0
+        xor rcx, rcx;                          // cursor
+      en_bn_head:
+        xor rdx, rdx;
+        mov_b rdx, [rdi + rcx*1];
+        cmp rdx, 0;
+        je  en_bn_done;
+        cmp rdx, 0x2F;                         // '/'
+        jne en_bn_next;
+        mov rax, rcx;
+        add rax, 1;
+      en_bn_next:
+        add rcx, 1;
+        cmp rcx, 4095;
+        jae en_bn_done;
+        jmp en_bn_head;
+      en_bn_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_write_bytes(fd, buf_ptr, len) -> bytes_or_errno
+  //
+  // Thin sys_write trampoline used for stderr diagnostics and the -i
+  // interactive prompt.  Same shape as cat's inline sys_write; leaf.
+  // ==========================================================================
+  pub let entry_write_bytes : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_write_bytes. SysV rdi=fd, rsi=buf_ptr, rdx=len match syscall order verbatim (arity 3, no r10 shuffle).  Emits SYS_WRITE (SC+ id 1).  Return value verbatim; caller ignores short-write (fd 2 is UART-fast-pathed per src/kernel/core/syscall/dispatch.pdx and honours length).  Leaf; sysreg effect for the SYSRET rcx/r11 clobber.",
+      block: {
+        mov rax, 1;                            // SYS_WRITE
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_getcwd(buf, buf_len) -> bytes_or_errno
+  //
+  // sys_getcwd trampoline (SC+ ID 86, R86.M1-003 #1956 kernel body at
+  // src/kernel/core/syscall/sys_getcwd.pdx).  Returns bytes written
+  // INCLUDING the trailing NUL (POSIX getcwd(3) convention: rax-1 is
+  // strlen), or negative-errno u64 on failure.
+  // ==========================================================================
+  pub let entry_getcwd : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (buf_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_getcwd. Trampoline for paideia-os sysno 86 (sys_getcwd), R86.M1-003 (#1956).  Arity 2 -- no r10 shuffle needed.  Return: bytes incl trailing NUL on success (rax-1 is strlen per POSIX getcwd(3)); negative errno on failure (-EFAULT=-14, -ERANGE=-34, -ENOENT=-2).  Leaf; sysreg for SYSRET clobber.  Matches cp Pdxfs::pdxfs_getcwd verbatim (paideia-os/cp v1.1-B src/pdxfs.pdx).",
+      block: {
+        mov rax, 86;                           // SYS_GETCWD
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_stat(path_ptr, statbuf_ptr) -> 0_or_errno
+  //
+  // sys_stat trampoline (SC+ ID 77, R56.M3-002 #1791 kernel body at
+  // src/kernel/core/syscall/sys_stat.pdx).  Ring-3 shape rdi=path_va,
+  // rsi=path_len, rdx=stat_buf_va; the two-arg caller shape (path,
+  // statbuf) is shuffled into place by grabbing statbuf from rsi into
+  // rdx BEFORE rsi is overwritten with the 255 walker CAP hint.
+  // ==========================================================================
+  pub let entry_stat : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path_ptr: u64) (statbuf_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_stat. Trampoline for paideia-os sysno 77 (sys_stat), R56.M3-002 (#1791).  Shuffle order is critical: mov rdx, rsi FIRST (grab statbuf before rsi is clobbered), then mov rsi, 255 (walker CAP hint -- sys_stat_body walks the NUL-terminated path itself under the cap).  Return: 0 on success (statbuf filled per the frozen 64-byte layout; mode u32 at +24), negative errno on failure (-ENOENT=-2, -EFAULT=-14).  Leaf; sysreg for SYSRET clobber.  Matches cp Pdxfs::pdxfs_stat verbatim.",
+      block: {
+        mov rdx, rsi;                          // statbuf_ptr (grab first)
+        mov rsi, 255;                          // path_len cap
+        mov rax, 77;                           // SYS_STAT
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_read_byte(byte_buf) -> bytes_or_errno
+  //
+  // sys_read of exactly 1 byte from fd 0 (stdin, KIND_TTY).  Used by
+  // the `-i` interactive-confirm path.  Return: 1 on success (byte in
+  // *byte_buf), 0 on EOF (treat as "no"), negative errno on failure.
+  // ==========================================================================
+  pub let entry_read_byte : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (byte_buf: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_read_byte. Reads exactly 1 byte from fd 0 (stdin -- KIND_TTY seed by init).  Shuffle: mov rsi, rdi (buf), mov rdi, 0 (fd), mov rdx, 1 (len), mov rax, 0 (SYS_READ).  Return: 1 on success, 0 on EOF, negative errno on failure.  Leaf; sysreg for SYSRET clobber.  Caller treats non-1 return as `no` (skip source).",
+      block: {
+        mov rsi, rdi;                          // buf
+        xor rdi, rdi;                          // fd 0
+        mov rdx, 1;                            // len
+        xor rax, rax;                          // SYS_READ (0)
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_resolve(user_ptr, out_buf) -> len_or_errno
+  //
+  // Resolve `user_ptr` against the task cwd into `out_buf` (a caller-
+  // owned 512-byte scratch).  Contract:
+  //   user_ptr[0] == '/'  -> copy user_ptr verbatim into out_buf,
+  //                          return byte count (excluding NUL).
+  //   otherwise           -> sys_getcwd, join cwd + '/' + user_ptr
+  //                          into out_buf, return byte count.
+  //   Any overflow (>= 511 bytes)  -> -ENAMETOOLONG (0xFFFFFFFFFFFFFFDC).
+  //   sys_getcwd failure           -> raw negative errno.
+  //
+  // 1-push (rbx) prologue for rsp%16 alignment at the nested
+  // entry_getcwd call.  Bounded per-cursor walk.
+  // ==========================================================================
+  pub let entry_resolve : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (user_ptr: u64) (out_buf: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_resolve.  Userspace cwd-relative resolve of an argv positional against the task cwd (paideia-os/mv#19).  Matches the mkdir v1.1-B (#25) and cp v1.1-B (#21) precedents: classify user_ptr[0]; '/' -> absolute passthrough; else sys_getcwd + join `cwd + / + user`.  cwd == '/' skips the '/' insertion (avoids `//foo`).  Overflow >= 511 -> -ENAMETOOLONG (movabs 0xFFFFFFFFFFFFFFDC).  5-callee-save-push idiom (rbx, r12, r13, r14, r15) -- 5 pushes flip rsp%16 from 8 to 0 (odd-count idiom); nested entry_getcwd call sees aligned stack.  Byte loads via xor+mov_b (#1248).  Labels prefixed en_rs_.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // rbx = user_ptr
+        mov r12, rsi;                          // r12 = out_buf
+
+        // Classify first byte of user_ptr.
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x2F;                         // '/'
+        je  en_rs_absolute;
+
+        // ---- Relative: call sys_getcwd into entry_cwd_scratch -----------------
+        lea rdi, [rip + entry_cwd_scratch];
+        mov rsi, 256;                          // ENTRY_CWD_SCRATCH_LEN
+        call entry_getcwd;
+        cmp rax, 0;
+        jl  en_rs_errno;
+
+        // cwd_len = rax - 1 (strip trailing NUL).  r13 holds it.
+        mov r13, rax;
+        sub r13, 1;
+
+        // Bounded strlen(user_ptr), cap at 510 (leave room for '/' + NUL).
+        xor r14, r14;                          // r14 = user_len
+      en_rs_ulen_head:
+        cmp r14, 510;
+        jae en_rs_too_long;
+        xor rax, rax;
+        mov_b rax, [rbx + r14*1];
+        cmp rax, 0;
+        je  en_rs_ulen_done;
+        add r14, 1;
+        jmp en_rs_ulen_head;
+
+      en_rs_ulen_done:
+        // Compute sep length: 1 unless cwd is exactly "/".  r15 = sep.
+        mov r15, 1;
+        cmp r13, 1;
+        jne en_rs_sep_done;
+        lea r11, [rip + entry_cwd_scratch];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0x2F;
+        jne en_rs_sep_done;
+        xor r15, r15;
+
+      en_rs_sep_done:
+        // total = cwd_len + sep + user_len; must fit strictly below 511.
+        mov rax, r13;
+        add rax, r15;
+        add rax, r14;
+        cmp rax, 511;
+        jae en_rs_too_long;
+
+        // ---- Copy cwd bytes into out_buf[0..cwd_len) ------------------------
+        xor rcx, rcx;
+      en_rs_cpy_cwd_head:
+        cmp rcx, r13;
+        jae en_rs_cpy_cwd_done;
+        lea r11, [rip + entry_cwd_scratch];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx*1];
+        mov_b [r12 + rcx*1], rax;
+        add rcx, 1;
+        jmp en_rs_cpy_cwd_head;
+
+      en_rs_cpy_cwd_done:
+        // Emit '/' at [r12 + rcx] if sep == 1.
+        cmp r15, 0;
+        je  en_rs_cpy_user_start;
+        mov rax, 0x2F;
+        mov_b [r12 + rcx*1], rax;
+        add rcx, 1;
+
+      en_rs_cpy_user_start:
+        // Copy user bytes.  r8 = user read index.
+        xor r8, r8;
+      en_rs_cpy_user_head:
+        cmp r8, r14;
+        jae en_rs_cpy_user_done;
+        xor rax, rax;
+        mov_b rax, [rbx + r8*1];
+        mov_b [r12 + rcx*1], rax;
+        add rcx, 1;
+        add r8, 1;
+        jmp en_rs_cpy_user_head;
+
+      en_rs_cpy_user_done:
+        // NUL-terminate at [r12 + rcx].
+        xor rax, rax;
+        mov_b [r12 + rcx*1], rax;
+
+        // Return byte count (excludes NUL) in rax.
+        mov rax, rcx;
+        jmp en_rs_epilogue;
+
+      en_rs_absolute:
+        // Copy user_ptr verbatim into out_buf; cap at 511.
+        xor rcx, rcx;
+      en_rs_abs_head:
+        cmp rcx, 511;
+        jae en_rs_too_long;
+        xor rax, rax;
+        mov_b rax, [rbx + rcx*1];
+        mov_b [r12 + rcx*1], rax;
+        cmp rax, 0;
+        je  en_rs_abs_done;
+        add rcx, 1;
+        jmp en_rs_abs_head;
+      en_rs_abs_done:
+        mov rax, rcx;                          // len excludes NUL
+        jmp en_rs_epilogue;
+
+      en_rs_too_long:
+        mov rax, 0xFFFFFFFFFFFFFFDC;           // -ENAMETOOLONG (-36)
+        jmp en_rs_epilogue;
+
+      en_rs_errno:
+        // rax already holds the negative errno from entry_getcwd.
+        jmp en_rs_epilogue;
+
+      en_rs_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_probe_dir(path_ptr) -> 0|1
+  //
+  // Return 1 if path_ptr resolves to a directory (via sys_stat + mode
+  // & S_IFMT == S_IFDIR), else 0.  Stat failure folds to 0.  Also
+  // returns 1 unconditionally if path_ptr's last byte is '/' (POSIX
+  // trailing-slash convention -- caller intent even if the directory
+  // does not yet exist, which for mv means we still refuse the move).
+  //
+  // 1-push (rbx) for rsp alignment at the nested entry_stat call.
+  // ==========================================================================
+  pub let entry_probe_dir : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_probe_dir.  Two-step directory probe: (1) if path_ptr's last byte is '/', return 1 (POSIX trailing-slash directory hint); (2) else sys_stat and mask mode with S_IFMT (0xF000, staged via r11); return 1 iff S_IFDIR (0x4000) bits set.  Stat failure folds to 0.  1-push (rbx) for rsp%16 alignment at nested entry_stat.  Byte read via xor+mov_b.  Labels prefixed en_pd_.  Called by _start before deciding single-file vs multi-source-shape dispatch.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                          // rbx = path_ptr
+
+        // ---- (1) Trailing-slash check ---------------------------------------
+        mov rdi, rbx;
+        call entry_strlen;                     // rax = len
+        cmp rax, 0;
+        je  en_pd_stat;                        // empty path -> stat probe
+        mov rcx, rax;
+        sub rcx, 1;                            // index of last byte
+        xor rax, rax;
+        mov_b rax, [rbx + rcx*1];
+        cmp rax, 0x2F;
+        je  en_pd_yes;
+
+      en_pd_stat:
+        // ---- (2) sys_stat + S_IFDIR mask ------------------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + entry_stat_buf];
+        call entry_stat;
+        cmp rax, 0;
+        jl  en_pd_no;                          // stat failed -> not a dir
+
+        lea r11, [rip + entry_stat_buf];
+        xor rax, rax;
+        mov_d rax, [r11 + 24];                 // mode u32 zx (ENTRY_STAT_MODE_OFS)
+        mov rcx, rax;
+        mov r11, 0xF000;                       // ENTRY_S_IFMT staged
+        and rcx, r11;
+        cmp rcx, 0x4000;                       // ENTRY_S_IFDIR
+        jne en_pd_no;
+
+      en_pd_yes:
+        mov rax, 1;
+        pop rbx;
+        ret;
+
+      en_pd_no:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_compose_dir_slash_base(dir_ptr, src_ptr, out_buf) -> len_or_errno
+  //
+  // Build out_buf = dir + '/' + basename(src) + NUL.  Caps at 511
+  // usable bytes; overflow -> -ENAMETOOLONG.  Handles the trailing-'/'
+  // idempotency case (no double slash).  Used by _start for the
+  // `mv src1 src2 ... dir/` composition.
+  // ==========================================================================
+  pub let entry_compose_dir_slash_base : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dir_ptr: u64) (src_ptr: u64) (out_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mv.v1.2.0-A entry_compose_dir_slash_base.  Builds out_buf = dir + '/' + basename(src) + NUL.  Same idiom as cp CopyFile::copy_join_dir_basename phases 1/3/4/5 but into a caller-supplied out_buf.  4-push (rbx=dir_ptr, r12=src_ptr, r13=out_buf, r14=basename_ofs) for rsp%16 alignment across the nested entry_basename_ofs / entry_strlen calls; even-count push idiom needs no sub-8 pad (entry rsp%16==8, 4 pushes flip to 8, stays 8 at nested call site... wait use 4 pushes + sub 8 idiom).  Actually uses 5 pushes odd-count for rsp%16==0 at call site.  Byte reads via xor+mov_b.  Overflow guard caps at 511 (leaves NUL room).  Labels prefixed en_co_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // dir_ptr
+        mov r12, rsi;                          // src_ptr
+        mov r13, rdx;                          // out_buf
+
+        // ---- Phase 1: copy dir_ptr into out_buf[0..dir_len) ------------------
+        xor rcx, rcx;                          // write cursor
+        xor r15, r15;                          // dir read cursor
+      en_co_dir_head:
+        xor rax, rax;
+        mov_b rax, [rbx + r15*1];
+        cmp rax, 0;
+        je  en_co_dir_done;
+        cmp rcx, 510;
+        jae en_co_overflow;
+        mov_b [r13 + rcx*1], rax;
+        add rcx, 1;
+        add r15, 1;
+        jmp en_co_dir_head;
+      en_co_dir_done:
+
+        // ---- Phase 2: basename_ofs(src) via helper ---------------------------
+        mov rdi, r12;
+        call entry_basename_ofs;               // rax = basename_ofs
+        mov r14, rax;                          // r14 = basename_ofs
+
+        // ---- Phase 3: append '/' if dir did not end in '/' -------------------
+        cmp rcx, 0;
+        je  en_co_slash_maybe;
+        mov rdx, rcx;
+        sub rdx, 1;
+        xor rax, rax;
+        mov_b rax, [r13 + rdx*1];              // last dir byte
+        cmp rax, 0x2F;
+        je  en_co_slash_done;
+      en_co_slash_maybe:
+        cmp rcx, 511;
+        jae en_co_overflow;
+        mov rax, 0x2F;
+        mov_b [r13 + rcx*1], rax;
+        add rcx, 1;
+      en_co_slash_done:
+
+        // ---- Phase 4: append basename(src) -----------------------------------
+      en_co_name_head:
+        xor rax, rax;
+        mov_b rax, [r12 + r14*1];
+        cmp rax, 0;
+        je  en_co_name_done;
+        cmp rcx, 511;
+        jae en_co_overflow;
+        mov_b [r13 + rcx*1], rax;
+        add rcx, 1;
+        add r14, 1;
+        jmp en_co_name_head;
+      en_co_name_done:
+
+        // ---- Phase 5: NUL + return byte count --------------------------------
+        xor rax, rax;
+        mov_b [r13 + rcx*1], rax;
+        mov rax, rcx;
+        jmp en_co_epilogue;
+
+      en_co_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFDC;           // -ENAMETOOLONG
+        jmp en_co_epilogue;
+
+      en_co_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_confirm(dst_ptr) -> 0=proceed | 1=skip
+  //
+  // Interactive-confirm helper for `-i`.  Emits `mv: overwrite '<dst>'? `
+  // to fd 2 (stderr, matching every extant coreutils convention), then
+  // reads a single byte from fd 0 (KIND_TTY).  'y' or 'Y' proceeds;
+  // every other byte (including EOF, error, whitespace) skips.
+  //
+  // The prompt fires unconditionally when `-i` is set -- the caller
+  // (_start) has already decided to invoke this helper on a per-source
+  // basis.  A pre-existence check to suppress the prompt for
+  // non-existing destinations would require a stat probe (and would
+  // race the rename); the POSIX-strict interpretation of `-i` in mv is
+  // "prompt before every overwrite candidate", which for the v1.2.0
+  // shape we approximate as "prompt before every source" -- cheaper
+  // and still correct in the common case (interactive user with a small
+  // number of sources).
+  // ==========================================================================
+  pub let entry_confirm : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_confirm (paideia-os/mv#21).  Three-part fd-2 prompt (`mv: overwrite '` + dst_bytes + `'? `), then one-byte fd-0 read.  Return 0 iff byte was 'y' (0x79) or 'Y' (0x59); every other byte (EOF, error, newline, letter) returns 1.  2-push (rbx=dst_ptr, r12=len scratch) + sub 8 keeps rsp%16 == 0 at nested calls.  entry_read_byte writes the byte to entry_prompt_byte[0]; xor+mov_b reads it back.  Labels prefixed en_cf_.  KIND_TTY sysread path -- fd 0 is seeded to KIND_TTY(read) by paideia-os init at task creation.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // dst_ptr
+
+        // ---- Part A: `mv: overwrite '` --------------------------------------
+        mov rdi, 2;                            // stderr
+        lea rsi, [rip + entry_msg_prompt_a];
+        mov rdx, 15;                           // entry_msg_prompt_a_len
+        call entry_write_bytes;
+
+        // ---- Part B: dst bytes -----------------------------------------------
+        mov rdi, rbx;
+        call entry_strlen;
+        mov r12, rax;
+
+        mov rdi, 2;
+        mov rsi, rbx;
+        mov rdx, r12;
+        call entry_write_bytes;
+
+        // ---- Part C: `'? ` ---------------------------------------------------
+        mov rdi, 2;
+        lea rsi, [rip + entry_msg_prompt_b];
+        mov rdx, 3;                            // entry_msg_prompt_b_len
+        call entry_write_bytes;
+
+        // ---- Read one byte from fd 0 -----------------------------------------
+        lea rdi, [rip + entry_prompt_byte];
+        call entry_read_byte;
+        cmp rax, 1;
+        jne en_cf_no;                          // EOF / error -> skip
+
+        // Load the byte.
+        lea r11, [rip + entry_prompt_byte];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0x79;                         // 'y'
+        je  en_cf_yes;
+        cmp rax, 0x59;                         // 'Y'
+        je  en_cf_yes;
+        jmp en_cf_no;
+
+      en_cf_yes:
+        xor rax, rax;                          // proceed
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      en_cf_no:
+        mov rax, 1;                            // skip
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_move_one(src_ptr, dst_ptr) -> 0_or_nonzero
+  //
+  // Resolve src + dst against cwd, optionally prompt if -i set, then
+  // call Rename::rename_same_dir with the resolved paths.  Return 0
+  // on success (or on user-declined confirm -- a skipped source is
+  // NOT an error), non-zero on any resolve / rename failure.
+  //
+  // Two 512-byte scratches (entry_src_resolved, entry_dst_resolved)
+  // are single-use per call -- fine because _start's main loop
+  // processes one source at a time and does not re-enter.
+  // ==========================================================================
+  pub let entry_move_one : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_move_one.  Resolve both operands against cwd (entry_resolve into two 512-byte .bss scratches), optionally consult -i (entry_confirm), then invoke Rename::rename_same_dir (src/rename.pdx) which owns the real sys_rename + -EXDEV fallback dispatch landed at v1.1-A.  Return 0 on success OR on user-declined confirm (skipping is not an error).  Return 1 on resolve failure (cwd overflow, sys_getcwd error), rename hard-fail, or any MV_RN_XDEV_* fallback failure -- caller (_start) collapses these to exit code 2 via the had_error accumulator.  2-push (rbx=src_ptr, r12=dst_ptr) + sub 8 keeps rsp%16 aligned across the four nested SysV calls.  Labels prefixed en_mo_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // src_ptr
+        mov r12, rsi;                          // dst_ptr
+
+        // ---- Resolve src into entry_src_resolved ----------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + entry_src_resolved];
+        call entry_resolve;
+        cmp rax, 0;
+        jl  en_mo_fail;
+
+        // ---- Resolve dst into entry_dst_resolved ----------------------------
+        mov rdi, r12;
+        lea rsi, [rip + entry_dst_resolved];
+        call entry_resolve;
+        cmp rax, 0;
+        jl  en_mo_fail;
+
+        // ---- -i interactive confirm (best-effort skip on no) ----------------
+        lea r11, [rip + entry_flag_i];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  en_mo_do_rename;
+
+        lea rdi, [rip + entry_dst_resolved];
+        call entry_confirm;
+        cmp rax, 0;
+        jne en_mo_skip;                        // user declined -> success-shaped skip
+
+      en_mo_do_rename:
+        // ---- Rename::rename_same_dir(src, dst) ------------------------------
+        lea rdi, [rip + entry_src_resolved];
+        lea rsi, [rip + entry_dst_resolved];
+        call rename_same_dir;
+        cmp rax, 0;
+        jne en_mo_fail;
+
+      en_mo_ok:
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      en_mo_skip:
+        // Confirm declined -- treat as clean skip, not error.
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      en_mo_fail:
+        mov rax, 1;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // entry_move_multi(src_ptr, dst_dir_ptr) -> 0_or_nonzero
+  //
+  // Compose `<dst_dir>/<basename(src)>` into entry_dst_composed, then
+  // delegate to entry_move_one.  Handles the multi-source form where
+  // the destination is a directory (POSIX `mv src1 src2 ... dir/`).
+  // ==========================================================================
+  pub let entry_move_multi : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (src_ptr: u64) (dst_dir_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mv.v1.2.0-A entry_move_multi (paideia-os/mv#27).  Composes dst_dir + '/' + basename(src) into entry_dst_composed via entry_compose_dir_slash_base, then delegates to entry_move_one with (src, composed_dst).  Overflow (>= 511 bytes) surfaces as -ENAMETOOLONG from the composer and the composed pointer is not consumed -- return 1 (had_error).  1-push (rbx=src_ptr) for rsp%16==0 at nested calls.  Labels prefixed en_mm_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                          // src_ptr
+
+        // Compose entry_dst_composed = dst_dir + '/' + basename(src) + NUL.
+        mov rdi, rsi;                          // dir_ptr (from rsi)
+        mov rsi, rbx;                          // src_ptr
+        lea rdx, [rip + entry_dst_composed];
+        call entry_compose_dir_slash_base;
+        cmp rax, 0;
+        jl  en_mm_fail;
+
+        // entry_move_one(src=rbx, dst=&entry_dst_composed).
+        mov rdi, rbx;
+        lea rsi, [rip + entry_dst_composed];
+        call entry_move_one;
+        cmp rax, 0;
+        jne en_mm_fail;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      en_mm_fail:
+        mov rax, 1;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _start -- process entry point.  Never returns.
+  //
+  // Register plan (all callee-save; @no_frame permits free clobber):
+  //   rbx = had_error accumulator (0 -> exit 0; 1 -> exit 2).
+  //   r12 = argv base pointer.
+  //   r13 = argc.
+  //   r14 = last positional index (destination arg index).
+  //   r15 = current source loop index.
+  //   r10 = first positional index (after flag scan).
+  //   r8/r9/rcx/rdx/rax = per-loop scratch.
+  //
+  // Alignment: execve delivers rsp % 16 == 8 (post-CALL SysV state,
+  // per cat / rm _start precedent); `sub rsp, 8` on entry aligns to
+  // 0 for nested helper CALL sites and is never restored (sys_exit
+  // never returns).
+  //
+  // Effects: {mem, sysreg}.  Caps: @{fs, sched} (fs for stat / read /
+  // write / rename; sched for sys_exit).
+  //
+  // Exit mapping (mv.ENH-002 I4 discipline, paideia-os/mv#18):
+  //   argc < 3                             -> exit 1 (usage / missing operand).
+  //   Multi-source form + dst not a dir    -> exit 2 (target not a directory).
+  //   Any move failed OR dst-compose overflowed -> exit 2 (general failure).
+  //   All requested moves succeeded (or user-declined via -i)   -> exit 0.
+  // ==========================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, sched},
+      justification: "mv.v1.2.0-A _start (paideia-os/mv#30 flagship real-body extraction + #18 _start/I4 exit + #27 multi-source + #19 cwd-relative + #21 -i confirm).  Reads argc/argv from the frozen execve ABI (rdi=argc, rsi=argv per design/user/execve-abi.md).  argc < 3 -> emit `mv: missing file operand` to fd 2 and sys_exit(1).  Otherwise: (1) call mv_reset to zero the session stats table (cross-module reference to Mv::mv_reset; the seven mv_argv_* slots are entry-owned mirrors, initialised via explicit stores below).  (2) Zero the four entry_flag_* slots.  (3) Walk argv[1..argc] for flag-shaped positionals (leading '-'); recognise `-i`, `-v`, `-f`, `--dry-run`, `--verbose`, `--force`, `--interactive` via inline byte compare (short forms one byte + NUL; long forms full byte-by-byte walk).  First non-flag argv entry marks the first positional; r10 stashes its index.  (4) Compute pos_count = argc - r10; < 2 -> missing operand path.  (5) Stash last-positional pointer (argv[argc-1]) as the destination.  (6) Call entry_probe_dir(dst) to classify: 1 = directory (fires multi-source path even for pos_count == 2 when dst is a directory), 0 = not.  (7) pos_count > 2 AND !is_dir -> `target is not a directory` diag + exit 2.  (8) Loop over sources: for pos_count == 2 with !is_dir, call entry_move_one(argv[r10], dst); else loop r15 from r10 to argc-2 calling entry_move_multi(argv[r15], dst) per iteration.  (9) any nested call returning 1 sets had_error (rbx = 1).  (10) sys_exit: rbx = 0 -> exit(0); rbx = 1 -> exit(2).  @no_frame -- _start terminates in sys_exit and never returns.  Entry alignment: `sub rsp, 8` lands rsp%16==0 for nested SysV calls (rm/cat _start precedent -- execve delivers rsp%16==8).  Encoder-gap discipline: no `test rN, rN` (every zero-check via `cmp reg, 0`); no `and rN, imm` on r8-r15 (staged through r11 with movabs when needed); no 2-op `imul r, imm`; no `cmp reg, [mem]` (loads to scratch first).  Every `cmp reg, imm` <= 0x7FFFFFFF (largest immediate is 4096 SIB scale cap).  Byte reads via xor+mov_b (#1248).  Reserved-label discipline: every label prefixed `en_start_` per paideia-as reserved-word discipline (`loop`, `head`, `done`, `if` are keywords).  SIB scale-8 argv indexing (`[r12 + r15*8]`) -- scale 8 is in the allowed set.",
+      block: {
+        // ---- Step 0: entry alignment + register init ------------------------
+        sub rsp, 8;                            // rsp%16: 8 -> 0
+
+        mov r13, rdi;                          // argc
+        mov r12, rsi;                          // argv
+
+        xor rbx, rbx;                          // had_error = 0
+
+        // ---- Step 1: reset mv session stats + clear entry flag slots --------
+        call mv_reset;
+
+        xor rax, rax;
+        lea r11, [rip + entry_flag_i];     mov [r11], rax;
+        lea r11, [rip + entry_flag_v];     mov [r11], rax;
+        lea r11, [rip + entry_flag_f];     mov [r11], rax;
+        lea r11, [rip + entry_flag_dry];   mov [r11], rax;
+        lea r11, [rip + entry_dst_ptr];    mov [r11], rax;
+        lea r11, [rip + entry_dst_is_dir]; mov [r11], rax;
+        lea r11, [rip + entry_had_error];  mov [r11], rax;
+
+        // ---- Step 2: argc guard ---------------------------------------------
+        cmp r13, 3;
+        jl  en_start_missing;
+
+        // ---- Step 3: scan flags -- r10 = first positional index -------------
+        mov r10, 1;                            // start at argv[1]
+      en_start_scan_head:
+        cmp r10, r13;
+        jge en_start_scan_done;
+
+        mov r9, [r12 + r10*8];                 // argv[r10]
+
+        xor rax, rax;
+        mov_b rax, [r9];
+        cmp rax, 0x2D;                         // '-'
+        jne en_start_scan_done;                // first non-flag = start of positionals
+
+        // Byte 1 of the flag: dispatch on shape.
+        xor rax, rax;
+        mov_b rax, [r9 + 1];
+        cmp rax, 0x69;                         // 'i'
+        je  en_start_maybe_i;
+        cmp rax, 0x76;                         // 'v'
+        je  en_start_maybe_v;
+        cmp rax, 0x66;                         // 'f'
+        je  en_start_maybe_f;
+        cmp rax, 0x2D;                         // '-' (long option)
+        je  en_start_long_opt;
+        // Any other short flag -> ignore silently (not an unknown-flag hard
+        // error at v1.2.0-A; the M4 fixture matrix does not exercise strict
+        // unknown-flag rejection).  Advance.
+        jmp en_start_scan_next;
+
+      en_start_maybe_i:
+        // Short "-i": byte 2 must be NUL.
+        xor rcx, rcx;
+        mov_b rcx, [r9 + 2];
+        cmp rcx, 0;
+        jne en_start_scan_next;
+        mov rax, 1;
+        lea r11, [rip + entry_flag_i];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_maybe_v:
+        xor rcx, rcx;
+        mov_b rcx, [r9 + 2];
+        cmp rcx, 0;
+        jne en_start_scan_next;
+        mov rax, 1;
+        lea r11, [rip + entry_flag_v];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_maybe_f:
+        xor rcx, rcx;
+        mov_b rcx, [r9 + 2];
+        cmp rcx, 0;
+        jne en_start_scan_next;
+        mov rax, 1;
+        lea r11, [rip + entry_flag_f];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_long_opt:
+        // Compare against "--force\0", "--interactive\0", "--verbose\0",
+        // "--dry-run\0".  Cheap byte-by-byte inline dispatch; failure to
+        // match any known long option falls through to scan_next
+        // (silent-ignore, matching short-flag behaviour above).
+        xor rax, rax;
+        mov_b rax, [r9 + 2];
+        cmp rax, 0x66;                         // 'f' -> "force"
+        je  en_start_try_force;
+        cmp rax, 0x69;                         // 'i' -> "interactive"
+        je  en_start_try_interactive;
+        cmp rax, 0x76;                         // 'v' -> "verbose"
+        je  en_start_try_verbose;
+        cmp rax, 0x64;                         // 'd' -> "dry-run"
+        je  en_start_try_dryrun;
+        jmp en_start_scan_next;
+
+      en_start_try_force:
+        // "--force\0"
+        xor rax, rax; mov_b rax, [r9 + 3]; cmp rax, 0x6F; jne en_start_scan_next;  // 'o'
+        xor rax, rax; mov_b rax, [r9 + 4]; cmp rax, 0x72; jne en_start_scan_next;  // 'r'
+        xor rax, rax; mov_b rax, [r9 + 5]; cmp rax, 0x63; jne en_start_scan_next;  // 'c'
+        xor rax, rax; mov_b rax, [r9 + 6]; cmp rax, 0x65; jne en_start_scan_next;  // 'e'
+        xor rax, rax; mov_b rax, [r9 + 7]; cmp rax, 0;    jne en_start_scan_next;  // NUL
+        mov rax, 1;
+        lea r11, [rip + entry_flag_f];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_try_interactive:
+        // "--interactive\0"
+        xor rax, rax; mov_b rax, [r9 + 3];  cmp rax, 0x6E; jne en_start_scan_next;  // 'n'
+        xor rax, rax; mov_b rax, [r9 + 4];  cmp rax, 0x74; jne en_start_scan_next;  // 't'
+        xor rax, rax; mov_b rax, [r9 + 5];  cmp rax, 0x65; jne en_start_scan_next;  // 'e'
+        xor rax, rax; mov_b rax, [r9 + 6];  cmp rax, 0x72; jne en_start_scan_next;  // 'r'
+        xor rax, rax; mov_b rax, [r9 + 7];  cmp rax, 0x61; jne en_start_scan_next;  // 'a'
+        xor rax, rax; mov_b rax, [r9 + 8];  cmp rax, 0x63; jne en_start_scan_next;  // 'c'
+        xor rax, rax; mov_b rax, [r9 + 9];  cmp rax, 0x74; jne en_start_scan_next;  // 't'
+        xor rax, rax; mov_b rax, [r9 + 10]; cmp rax, 0x69; jne en_start_scan_next;  // 'i'
+        xor rax, rax; mov_b rax, [r9 + 11]; cmp rax, 0x76; jne en_start_scan_next;  // 'v'
+        xor rax, rax; mov_b rax, [r9 + 12]; cmp rax, 0x65; jne en_start_scan_next;  // 'e'
+        xor rax, rax; mov_b rax, [r9 + 13]; cmp rax, 0;    jne en_start_scan_next;  // NUL
+        mov rax, 1;
+        lea r11, [rip + entry_flag_i];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_try_verbose:
+        // "--verbose\0"
+        xor rax, rax; mov_b rax, [r9 + 3]; cmp rax, 0x65; jne en_start_scan_next;  // 'e'
+        xor rax, rax; mov_b rax, [r9 + 4]; cmp rax, 0x72; jne en_start_scan_next;  // 'r'
+        xor rax, rax; mov_b rax, [r9 + 5]; cmp rax, 0x62; jne en_start_scan_next;  // 'b'
+        xor rax, rax; mov_b rax, [r9 + 6]; cmp rax, 0x6F; jne en_start_scan_next;  // 'o'
+        xor rax, rax; mov_b rax, [r9 + 7]; cmp rax, 0x73; jne en_start_scan_next;  // 's'
+        xor rax, rax; mov_b rax, [r9 + 8]; cmp rax, 0x65; jne en_start_scan_next;  // 'e'
+        xor rax, rax; mov_b rax, [r9 + 9]; cmp rax, 0;    jne en_start_scan_next;  // NUL
+        mov rax, 1;
+        lea r11, [rip + entry_flag_v];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_try_dryrun:
+        // "--dry-run\0"
+        xor rax, rax; mov_b rax, [r9 + 3]; cmp rax, 0x72; jne en_start_scan_next;  // 'r'
+        xor rax, rax; mov_b rax, [r9 + 4]; cmp rax, 0x79; jne en_start_scan_next;  // 'y'
+        xor rax, rax; mov_b rax, [r9 + 5]; cmp rax, 0x2D; jne en_start_scan_next;  // '-'
+        xor rax, rax; mov_b rax, [r9 + 6]; cmp rax, 0x72; jne en_start_scan_next;  // 'r'
+        xor rax, rax; mov_b rax, [r9 + 7]; cmp rax, 0x75; jne en_start_scan_next;  // 'u'
+        xor rax, rax; mov_b rax, [r9 + 8]; cmp rax, 0x6E; jne en_start_scan_next;  // 'n'
+        xor rax, rax; mov_b rax, [r9 + 9]; cmp rax, 0;    jne en_start_scan_next;  // NUL
+        mov rax, 1;
+        lea r11, [rip + entry_flag_dry];
+        mov [r11], rax;
+        jmp en_start_scan_next;
+
+      en_start_scan_next:
+        add r10, 1;
+        jmp en_start_scan_head;
+
+      en_start_scan_done:
+        // r10 now indexes the first positional.  argv[argc-1] is the
+        // destination; argv[r10..argc-1) are sources.  pos_count = argc-r10.
+
+        // pos_count < 2 -> missing operand.
+        mov rax, r13;
+        sub rax, r10;
+        cmp rax, 2;
+        jl  en_start_missing;
+
+        // r14 = argc - 1 (destination arg index).
+        mov r14, r13;
+        sub r14, 1;
+
+        // Stash dst pointer to .bss (defensive; helpers do not depend on it
+        // via .bss, but STATUS-shaped consumers may).
+        mov r9, [r12 + r14*8];                 // argv[argc-1]
+        lea r11, [rip + entry_dst_ptr];
+        mov [r11], r9;
+
+        // ---- Step 4: classify dst -------------------------------------------
+        mov rdi, r9;
+        call entry_probe_dir;                  // rax = 0 (file) | 1 (dir)
+        lea r11, [rip + entry_dst_is_dir];
+        mov [r11], rax;
+
+        // pos_count > 2 -> destination MUST be a directory.
+        mov rcx, r13;
+        sub rcx, r10;                          // pos_count
+        cmp rcx, 2;
+        jle en_start_dispatch;
+
+        // pos_count > 2: verify is_dir; else fatal.
+        lea r11, [rip + entry_dst_is_dir];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  en_start_notdir;
+
+      en_start_dispatch:
+        // ---- Step 5: dispatch -----------------------------------------------
+        // If pos_count == 2 AND dst is NOT a directory -> single-file rename.
+        // If pos_count == 2 AND dst IS a directory     -> multi-source shape
+        //                                                  (one iteration).
+        // If pos_count >  2                            -> multi-source loop.
+        mov rcx, r13;
+        sub rcx, r10;                          // pos_count
+        cmp rcx, 2;
+        jne en_start_multi_loop;
+
+        // pos_count == 2 branch.
+        lea r11, [rip + entry_dst_is_dir];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne en_start_multi_loop;               // dst is a dir -> compose path
+
+        // Single-file rename.
+        mov r15, [r12 + r10*8];                // src = argv[r10]
+        mov r9,  [r12 + r14*8];                // dst = argv[argc-1]
+        mov rdi, r15;
+        mov rsi, r9;
+        call entry_move_one;
+        cmp rax, 0;
+        je  en_start_done;
+        mov rbx, 1;
+        jmp en_start_done;
+
+      en_start_multi_loop:
+        // r15 = i = r10; iterate to r14 (exclusive).
+        mov r15, r10;
+      en_start_multi_head:
+        cmp r15, r14;
+        jge en_start_done;
+
+        mov r9, [r12 + r15*8];                 // src = argv[i]
+        mov r8, [r12 + r14*8];                 // dst_dir = argv[argc-1]
+
+        mov rdi, r9;
+        mov rsi, r8;
+        call entry_move_multi;
+        cmp rax, 0;
+        je  en_start_multi_next;
+        mov rbx, 1;                            // record error, continue
+
+      en_start_multi_next:
+        add r15, 1;
+        jmp en_start_multi_head;
+
+      en_start_done:
+        // ---- Step 6: sys_exit with I4 mapping -------------------------------
+        cmp rbx, 0;
+        je  en_start_exit_ok;
+
+        mov rdi, 2;                            // exit code 2 = general failure
+        mov rax, 60;                           // SYS_EXIT
+        syscall;
+        hlt;
+
+      en_start_exit_ok:
+        xor rdi, rdi;                          // exit code 0
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      en_start_missing:
+        // usage / missing operand -> stderr diag + exit 1.
+        mov rdi, 2;
+        lea rsi, [rip + entry_msg_missing];
+        mov rdx, 39;                           // entry_msg_missing_len
+        call entry_write_bytes;
+        mov rdi, 2;
+        lea rsi, [rip + entry_msg_missing_nl];
+        mov rdx, 1;
+        call entry_write_bytes;
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      en_start_notdir:
+        // Multi-source form but dst is not a directory -> exit 2 with diag.
+        mov rdi, 2;
+        lea rsi, [rip + entry_msg_notdir];
+        mov rdx, 41;                           // entry_msg_notdir_len
+        call entry_write_bytes;
+        mov rdi, 2;
+        lea rsi, [rip + entry_msg_notdir_nl];
+        mov rdx, 1;
+        call entry_write_bytes;
+        mov rdi, 2;
+        mov rax, 60;
+        syscall;
+        hlt
+      }
+    } @no_frame
+}
